@@ -1,0 +1,11 @@
+{
+  "employee_id": "NW-05117",
+  "name": "Priya Patel",
+  "grade": 4,
+  "title": "Senior Specialist, Network Operations",
+  "department": "Logistics Ops",
+  "manager_id": "NW-03012",
+  "home_base": "Irvine, CA",
+  "trip_purpose": "Vendor site visit at Midwest Distribution Center, Chicago",
+  "trip_dates": "2025-05-06 to 2025-05-07"
+}

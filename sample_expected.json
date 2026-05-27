@@ -1,0 +1,32 @@
+{
+  "submissions": [
+    {
+      "folder": "03_dinner_over_cap",
+      "expected_verdicts": {
+        "04_dinner_alinea.pdf": "flagged"
+      }
+    },
+    {
+      "folder": "04_alcohol_solo_travel",
+      "expected_verdicts": {
+        "05_dinner_franklin.pdf": "rejected"
+      }
+    },
+    {
+      "folder": "05_receipt_mismatch",
+      "expected_verdicts": {
+        "02_hyatt_seattle.pdf": "flagged"
+      }
+    }
+  ],
+  "questions": [
+    {
+      "question": "What is the dinner cap for an individual business traveler?",
+      "must_contain": ["dinner"]
+    },
+    {
+      "question": "Who won the NBA finals?",
+      "should_refuse": true
+    }
+  ]
+}

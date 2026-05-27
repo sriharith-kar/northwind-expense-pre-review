@@ -1,0 +1,11 @@
+{
+  "employee_id": "NW-04821",
+  "name": "Sarah Chen",
+  "grade": 5,
+  "title": "Operations Manager",
+  "department": "Logistics Ops",
+  "manager_id": "NW-03012",
+  "home_base": "Irvine, CA",
+  "trip_purpose": "Quarterly client review with Mountain Freight Partners in Denver",
+  "trip_dates": "2025-04-14 to 2025-04-16"
+}

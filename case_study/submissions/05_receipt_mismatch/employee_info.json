@@ -1,0 +1,11 @@
+{
+  "employee_id": "NW-04102",
+  "name": "Linda Foster",
+  "grade": 5,
+  "title": "Manager, Customer Operations",
+  "department": "Customer Success",
+  "manager_id": "NW-02201",
+  "home_base": "Irvine, CA",
+  "trip_purpose": "Quarterly QBR with PNW client account (Pacific Coast Distributors)",
+  "trip_dates": "2025-02-11 to 2025-02-13"
+}

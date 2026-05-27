@@ -1,0 +1,11 @@
+{
+  "employee_id": "NW-02719",
+  "name": "Marcus Rivera",
+  "grade": 7,
+  "title": "Director, Cloud Infrastructure",
+  "department": "Technology",
+  "manager_id": "NW-01104",
+  "home_base": "Irvine, CA",
+  "trip_purpose": "AWS re:Inforce 2025 conference attendance — security architecture track",
+  "trip_dates": "2025-06-09 to 2025-06-12"
+}

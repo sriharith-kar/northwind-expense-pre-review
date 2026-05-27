@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.sqlite
+*.db
+runtime_uploads/
+.env
+.venv/
+venv/
+
+# Local eval artifacts
+after_metrics*.txt
+before_metrics.txt
+metrics*.json
+

@@ -1,0 +1,11 @@
+{
+  "employee_id": "NW-03488",
+  "name": "James Walker",
+  "grade": 6,
+  "title": "Senior Manager, Carrier Relations",
+  "department": "Logistics Ops",
+  "manager_id": "NW-01104",
+  "home_base": "Irvine, CA",
+  "trip_purpose": "Solo carrier research trip — meeting potential regional partners in Austin",
+  "trip_dates": "2025-03-18 to 2025-03-20"
+}
