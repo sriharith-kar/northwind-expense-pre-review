@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import cgi
 import datetime as dt
 import hashlib
 import html
@@ -17,6 +16,8 @@ import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from email import policy as email_policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1219,6 +1220,32 @@ class AppHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
+    def read_multipart_form(self) -> tuple[dict[str, list[str]], list[tuple[str, str, bytes]]]:
+        """Parse browser multipart uploads without deprecated cgi.FieldStorage."""
+        length = int(self.headers.get("Content-Length", "0"))
+        content_type = self.headers.get("Content-Type", "")
+        body = self.rfile.read(length)
+        message = BytesParser(policy=email_policy.default).parsebytes(
+            b"Content-Type: " + content_type.encode("utf-8") + b"\r\n"
+            b"MIME-Version: 1.0\r\n\r\n" + body
+        )
+        fields: dict[str, list[str]] = {}
+        files: list[tuple[str, str, bytes]] = []
+        for part in message.iter_parts():
+            disposition = part.get("Content-Disposition", "")
+            if not disposition:
+                continue
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename:
+                files.append((name, filename, payload))
+            else:
+                fields.setdefault(name, []).append(payload.decode(part.get_content_charset() or "utf-8"))
+        return fields, files
+
     def do_GET(self) -> None:
         try:
             if self.path == "/" or self.path.startswith("/?"):
@@ -1265,15 +1292,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 500)
 
     def handle_review_upload(self) -> None:
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-            },
-        )
-        employee_json = form.getfirst("employee")
+        fields, files = self.read_multipart_form()
+        employee_json = fields.get("employee", [None])[0]
         if not employee_json:
             return self.send_json({"error": "employee payload is required"}, 400)
         employee = json.loads(employee_json)
@@ -1281,18 +1301,14 @@ class AppHandler(BaseHTTPRequestHandler):
             employee["employee_id"] = "NW-" + uuid.uuid4().hex[:8].upper()
         upload_dir = UPLOAD_DIR / ("incoming-" + uuid.uuid4().hex)
         upload_dir.mkdir(parents=True, exist_ok=True)
-        receipt_fields = form["receipts"] if "receipts" in form else []
-        if not isinstance(receipt_fields, list):
-            receipt_fields = [receipt_fields]
         paths = []
-        for field in receipt_fields:
-            if not getattr(field, "filename", None):
+        for field_name, filename, payload in files:
+            if field_name != "receipts" or not filename:
                 continue
-            original_name = Path(field.filename).name
+            original_name = Path(filename).name
             safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", original_name).strip(".-") or f"receipt-{uuid.uuid4().hex}.dat"
             target = upload_dir / safe_name
-            with target.open("wb") as out:
-                shutil.copyfileobj(field.file, out)
+            target.write_bytes(payload)
             paths.append(target)
         if not paths:
             return self.send_json({"error": "At least one receipt file is required"}, 400)
