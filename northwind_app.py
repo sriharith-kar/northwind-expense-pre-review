@@ -1208,22 +1208,28 @@ def seed_employees() -> None:
             continue
 
 
+def reusable_submission_detail(detail: dict[str, Any] | None, receipt_paths: list[Path]) -> bool:
+    if not detail or detail.get("status") == "processing":
+        return False
+    items = detail.get("items", [])
+    if len(items) != len(receipt_paths):
+        return False
+    if not all(item.get("pipeline_trace") for item in items):
+        return False
+    return not any(
+        step.get("status") == "error"
+        for item in items
+        for step in item.get("pipeline_trace", [])
+    )
+
+
 def process_submission(employee: dict[str, Any], receipt_paths: list[Path], source_key: str | None = None) -> str:
     STORE.upsert_employee(employee)
     if source_key:
         existing = STORE.source_submission(source_key)
         if existing:
             detail = STORE.submission_detail(existing)
-            items = detail.get("items", []) if detail else []
-            has_expected_items = len(items) == len(receipt_paths)
-            has_complete_trace = has_expected_items and all(item.get("pipeline_trace") for item in items)
-            has_trace_errors = any(
-                step.get("status") == "error"
-                for item in items
-                for step in item.get("pipeline_trace", [])
-            )
-            is_finalized = bool(detail and detail.get("status") != "processing")
-            if is_finalized and has_complete_trace and not has_trace_errors:
+            if reusable_submission_detail(detail, receipt_paths):
                 return existing
             STORE.delete_submission(existing)
     sid = STORE.create_submission(employee["employee_id"], employee.get("trip_purpose", ""), employee.get("trip_dates", ""), source_key)
@@ -1275,17 +1281,27 @@ def process_submission(employee: dict[str, Any], receipt_paths: list[Path], sour
     return sid
 
 
-def load_sample_submissions() -> list[str]:
-    created = []
+def load_sample_submissions(process_limit: int = 1) -> dict[str, Any]:
+    submission_ids = []
+    processed = 0
+    remaining = 0
     base = CASE_STUDY_DIR / "submissions"
     for folder in sorted(base.glob("*")):
         info = folder / "employee_info.json"
         receipts = sorted((folder / "receipts").glob("*"))
         if info.exists() and receipts:
             employee = json.loads(info.read_text(encoding="utf-8"))
-            sid = process_submission(employee, receipts, source_key=folder.name)
-            created.append(sid)
-    return created
+            existing = STORE.source_submission(folder.name)
+            if existing and reusable_submission_detail(STORE.submission_detail(existing), receipts):
+                submission_ids.append(existing)
+                continue
+            if processed < process_limit:
+                sid = process_submission(employee, receipts, source_key=folder.name)
+                submission_ids.append(sid)
+                processed += 1
+            else:
+                remaining += 1
+    return {"submission_ids": submission_ids, "processed": processed, "remaining": remaining}
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -1377,8 +1393,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 STORE.upsert_employee(payload)
                 return self.send_json({"ok": True})
             if self.path == "/api/load-samples":
-                ids = load_sample_submissions()
-                return self.send_json({"submission_ids": ids})
+                return self.send_json(load_sample_submissions())
             if self.path == "/api/policy-question":
                 payload = self.read_json()
                 return self.send_json(POLICY.answer(str(payload.get("question", ""))))
@@ -1956,10 +1971,17 @@ INDEX_HTML = r"""<!doctype html>
     $("loadSamples").addEventListener("click", async () => {
       $("loadSamples").disabled = true;
       try {
-        const data = await api("/api/load-samples", {method: "POST"});
-        await loadHistory();
-        if (data.submission_ids[0]) await openSubmission(data.submission_ids[0]);
+        let latest = null;
+        let round = 0;
+        do {
+          round += 1;
+          $("loadSamples").textContent = `Loading samples ${round}...`;
+          latest = await api("/api/load-samples", {method: "POST"});
+          await loadHistory();
+        } while (latest.remaining > 0);
+        if (latest.submission_ids[0]) await openSubmission(latest.submission_ids[0]);
       } finally {
+        $("loadSamples").textContent = "Load sample submissions";
         $("loadSamples").disabled = false;
       }
     });
