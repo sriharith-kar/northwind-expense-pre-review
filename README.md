@@ -6,7 +6,7 @@ The system is intentionally a pre-review tool, not an auto-approver. It highligh
 
 ## Current Status
 
-- Deployment target: Render
+- Active deployment target: Render
 - Source branch: `main`
 - Model: `gemini-2.5-flash`
 - Embeddings: `gemini-embedding-001`
@@ -15,7 +15,7 @@ The system is intentionally a pre-review tool, not an auto-approver. It highligh
 - Verified health state: `ok: true`, `gemini_configured: true`, `embedding_ready: true`, `index_error: ""`
 - Verified policy index: 43 policy chunks and 43 ready embeddings
 
-Render is the supported deployment target for this repo. Vercel is intentionally not used because the app needs a long-running Python service plus persistent SQLite/uploads; old Vercel deployment history in GitHub can be ignored or removed separately.
+Render is the only active deployment target for this repo. Vercel is no longer connected to the repository, and old Vercel GitHub deployment records have been removed.
 
 ## How To Use The App
 
@@ -153,7 +153,7 @@ https://<your-render-service>.onrender.com/api/health
 
 A healthy deployment returns `ok: true`, `gemini_configured: true`, `embedding_ready: true`, and an empty `index_error`.
 
-This project should not be deployed to Vercel in its current form. Vercel serverless deployments do not match the app's long-running stdlib server, local SQLite persistence, uploaded receipt storage, and policy-vector cache.
+This project should not be deployed to Vercel in its current form. Vercel serverless deployments do not match the app's long-running stdlib server, local SQLite persistence, uploaded receipt storage, and policy-vector cache. The repository has been cleaned up so Render is the deployment source of record.
 
 ## Architecture
 
