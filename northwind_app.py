@@ -5,12 +5,13 @@ import datetime as dt
 import hashlib
 import html
 import json
+import math
 import mimetypes
 import os
-import re
 import shutil
 import sqlite3
 import ssl
+import struct
 import sys
 import time
 import urllib.request
@@ -36,37 +37,32 @@ except Exception:  # pragma: no cover
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file(ROOT / ".env")
+
 CASE_STUDY_DIR = Path(os.environ.get("CASE_STUDY_DIR", ROOT / "case_study"))
 DB_PATH = Path(os.environ.get("NORTHWIND_DB", ROOT / "northwind.sqlite"))
 UPLOAD_DIR = Path(os.environ.get("NORTHWIND_UPLOADS", ROOT / "runtime_uploads"))
-
-
-TIER_1 = {
-    "new york", "san francisco", "boston", "washington", "los angeles",
-    "seattle", "london", "zurich", "tokyo", "singapore",
-}
-TIER_2 = {
-    "chicago", "denver", "atlanta", "austin", "dallas", "houston",
-    "miami", "portland", "san diego", "toronto", "amsterdam", "berlin",
-    "sydney",
-}
-MEAL_CAPS = {"breakfast": 25.0, "lunch": 35.0, "dinner": 75.0}
-ALCOHOL_WORDS = {
-    "beer", "wine", "hefeweizen", "ale", "cocktail", "vodka", "whiskey",
-    "whisky", "tequila", "mezcal", "bourbon", "champagne", "martini",
-    "pinot", "merlot", "cabernet", "lager", "stout", "ipa",
-}
-POLICY_SCOPE_TERMS = {
-    "accommodation", "airfare", "airline", "alcohol", "allowance", "approval",
-    "approve", "audit", "bag", "baggage", "breakfast", "business", "cap",
-    "card", "claim", "client", "conference", "concur", "corporate", "dinner",
-    "employee", "expense", "fare", "finance", "flight", "fuel", "gas", "grade",
-    "hotel", "incidentals", "lodging", "lunch", "manager", "meal", "mileage",
-    "parking", "per-diem", "policy", "receipt", "reimburs", "rental", "report",
-    "review", "rideshare", "submit", "taxi", "training", "travel", "trip",
-    "uber", "vendor", "wifi", "wi-fi", "lyft", "limit", "override",
-}
-POLICY_ID_PATTERN = re.compile(r"\b[A-Z]{2,5}-\d{3}\b", re.I)
+GEMINI_API_BASE = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", GEMINI_MODEL)
+GEMINI_EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+RETRIEVAL_TOP_K = int(os.environ.get("NORTHWIND_RETRIEVAL_TOP_K", "6"))
 
 
 def now_iso() -> str:
@@ -77,110 +73,168 @@ def json_dumps(data: Any) -> bytes:
     return json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def slug(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip()).strip("-").lower()
-    return value or "item"
-
-
 def money(value: float | None) -> str:
     if value is None:
         return "unknown"
     return f"${value:,.2f}"
 
 
-def normalize_text(text: str) -> str:
-    text = text.replace("\u2014", "-").replace("\u2013", "-").replace("\u00a0", " ")
-    return re.sub(r"[ \t]+", " ", text)
+def normalize_text(text: Any) -> str:
+    if text is None:
+        return ""
+    return " ".join(text.replace("\u2014", "-").replace("\u2013", "-").replace("\u00a0", " ").split())
 
 
-def tokenize(text: str) -> list[str]:
-    words = re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{1,}", text.lower())
-    stop = {
-        "the", "and", "for", "with", "that", "this", "from", "are", "was",
-        "were", "into", "must", "may", "not", "all", "any", "per", "its",
-        "has", "have", "when", "where", "what", "which", "who", "how",
-        "does", "can", "should", "will", "about", "under", "over",
-    }
-    return [w for w in words if w not in stop]
+def model_resource(model: str) -> str:
+    return model if model.startswith("models/") else f"models/{model}"
 
 
-def scope_token_forms(token: str) -> set[str]:
-    forms = {token}
-    for suffix in ("ing", "ed", "es", "s"):
-        if len(token) > len(suffix) + 3 and token.endswith(suffix):
-            forms.add(token[: -len(suffix)])
-    return forms
+def clean_json_text(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    return stripped
 
 
-def policy_scope_trace(question: str) -> tuple[bool, list[str], dict[str, Any]]:
-    started = time.perf_counter()
-    doc_ids = [match.upper() for match in POLICY_ID_PATTERN.findall(question)]
-    matches = set(doc_ids)
-    for token in tokenize(question):
-        forms = scope_token_forms(token)
-        for form in forms:
-            if form in POLICY_SCOPE_TERMS or any(term in form for term in POLICY_SCOPE_TERMS if len(term) >= 5):
-                matches.add(form)
-    ordered = sorted(matches)
-    in_scope = bool(ordered)
-    notes = (
-        "in_scope: matched " + ", ".join(f"'{match}'" for match in ordered[:6])
-        if in_scope
-        else "out_of_scope: no policy-domain terms detected"
-    )
-    return in_scope, ordered, {
-        "step_name": "scope_check",
-        "model_used": "n/a",
-        "latency_ms": round((time.perf_counter() - started) * 1000, 3),
-        "cost_usd": 0.0,
-        "status": "ok",
-        "notes": notes,
-    }
+def coerce_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def direct_policy_answer(question: str, policy: "PolicyIndex") -> dict[str, Any] | None:
-    tokens = set(tokenize(question))
-    if "dinner" in tokens and ("expense" in tokens or "cap" in tokens or "limit" in tokens):
-        citation = policy.clause("TEP-002", "2", "Meal expenses are subject to breakfast, lunch, and dinner caps.")
-        return {
-            "answer": f"{citation.doc_id} §{citation.section}: {citation.quote}",
-            "confidence": 0.9,
-            "citations": [citation_to_dict(citation)],
-            "refused": False,
+def coerce_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def clamp(value: Any, low: float, high: float, default: float) -> float:
+    number = coerce_float(value)
+    if number is None:
+        return default
+    return max(low, min(high, number))
+
+
+def pack_vector(values: list[float]) -> bytes:
+    return struct.pack(f"{len(values)}f", *values)
+
+
+def unpack_vector(blob: bytes) -> list[float]:
+    if not blob:
+        return []
+    return list(struct.unpack(f"{len(blob) // 4}f", blob))
+
+
+def normalize_vector(values: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in values))
+    if not norm:
+        return values
+    return [value / norm for value in values]
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    return sum(a * b for a, b in zip(left, right))
+
+
+class GeminiClient:
+    def __init__(self) -> None:
+        self.api_key = os.environ.get("GEMINI_API_KEY", "")
+        self.generate_model = GEMINI_MODEL
+        self.vision_model = GEMINI_VISION_MODEL
+        self.embedding_model = GEMINI_EMBEDDING_MODEL
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+    def _request(self, endpoint: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+        if not self.configured:
+            raise RuntimeError("GEMINI_API_KEY is not configured.")
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+            method="POST",
+        )
+        context = ssl.create_default_context()
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _set_usage(self, step: TraceStep | None, model: str, data: dict[str, Any]) -> None:
+        if step is None:
+            return
+        usage = data.get("usageMetadata") or {}
+        input_tokens = int(usage.get("promptTokenCount") or 0)
+        output_tokens = int(usage.get("candidatesTokenCount") or 0)
+        step.model_used = model
+        step.cost_usd = calculate_model_cost_usd(model, input_tokens, output_tokens)
+        step.notes = f"tokens input={input_tokens}, output={output_tokens}"
+
+    def _candidate_text(self, data: dict[str, Any]) -> str:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        output = []
+        for part in parts:
+            if "text" in part:
+                output.append(str(part.get("text") or ""))
+        return "\n".join(output).strip()
+
+    def generate_json(self, prompt: str, schema: dict[str, Any], trace_step: TraceStep | None = None, model: str | None = None, temperature: float = 0.1) -> dict[str, Any]:
+        model_name = model or self.generate_model
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": schema,
+            },
         }
-    if "alcohol" in tokens:
-        citation = policy.clause("TEP-003", "2", "Alcoholic beverages are reimbursable only during sanctioned client entertainment.")
-        return {
-            "answer": f"{citation.doc_id} §{citation.section}: {citation.quote}",
-            "confidence": 0.9,
-            "citations": [citation_to_dict(citation)],
-            "refused": False,
+        data = self._request(f"{GEMINI_API_BASE}/{model_resource(model_name)}:generateContent", payload)
+        self._set_usage(trace_step, model_name, data)
+        text = clean_json_text(self._candidate_text(data))
+        if not text:
+            raise RuntimeError("Gemini returned an empty JSON response.")
+        return json.loads(text)
+
+    def generate_text_with_image(self, path: Path, prompt: str, trace_step: TraceStep | None = None) -> str:
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inlineData": {"mimeType": mime, "data": base64.b64encode(path.read_bytes()).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.0},
         }
-    if tokens & {"uber", "lyft", "rideshare", "taxi"}:
-        citation = policy.clause("TEP-006", "2", "Rideshare and taxi rules govern Uber, Lyft, and equivalent business transportation.")
-        return {
-            "answer": f"{citation.doc_id} §{citation.section}: {citation.quote}",
-            "confidence": 0.9,
-            "citations": [citation_to_dict(citation)],
-            "refused": False,
-        }
-    if "per-diem" in tokens:
-        citation = policy.clause("TEP-008", "3", "Per-diem rates are set by city tier.")
-        return {
-            "answer": f"{citation.doc_id} §{citation.section}: {citation.quote}",
-            "confidence": 0.9,
-            "citations": [citation_to_dict(citation)],
-            "refused": False,
-        }
-    if "hotel" in tokens and ("approval" in tokens or "manager" in tokens or "booking" in tokens or "book" in tokens):
-        citation = policy.clause("TEP-004", "2", "Lodging booking requirements address Concur and manager approval.")
-        return {
-            "answer": f"{citation.doc_id} §{citation.section}: {citation.quote}",
-            "confidence": 0.9,
-            "citations": [citation_to_dict(citation)],
-            "refused": False,
-        }
-    return None
+        data = self._request(f"{GEMINI_API_BASE}/{model_resource(self.vision_model)}:generateContent", payload, timeout=90)
+        self._set_usage(trace_step, self.vision_model, data)
+        return self._candidate_text(data)
+
+    def embed_text(self, text: str, task_type: str, title: str = "", trace_step: TraceStep | None = None) -> list[float]:
+        payload: dict[str, Any] = {"content": {"parts": [{"text": text}]}, "taskType": task_type}
+        if title and task_type == "RETRIEVAL_DOCUMENT":
+            payload["title"] = title
+        data = self._request(f"{GEMINI_API_BASE}/{model_resource(self.embedding_model)}:embedContent", payload)
+        self._set_usage(trace_step, self.embedding_model, data)
+        values = data.get("embedding", {}).get("values") or []
+        return normalize_vector([float(value) for value in values])
 
 
 @dataclass
@@ -219,11 +273,113 @@ class ReviewResult:
     non_reimbursable_amount: float | None = None
 
 
+def nullable(kind: str) -> dict[str, Any]:
+    return {"type": [kind, "null"]}
+
+
+RECEIPT_FACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "vendor": {"type": "string"},
+        "date": nullable("string"),
+        "category": {"type": "string", "enum": ["air", "lodging", "ground", "meal", "conference", "unknown"]},
+        "meal_type": {"type": ["string", "null"], "enum": ["breakfast", "lunch", "dinner", "snack", "unknown", None]},
+        "amount": nullable("number"),
+        "subtotal": nullable("number"),
+        "tip": nullable("number"),
+        "tax": nullable("number"),
+        "nights": nullable("integer"),
+        "city": nullable("string"),
+        "confidence": {"type": "number"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["vendor", "date", "category", "meal_type", "amount", "subtotal", "tip", "tax", "nights", "city", "confidence", "warnings"],
+    "additionalProperties": False,
+}
+
+
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["compliant", "flagged", "rejected", "needs_review"]},
+        "confidence": {"type": "number"},
+        "reasoning": {"type": "string"},
+        "citation_chunk_ids": {"type": "array", "items": {"type": "string"}},
+        "reimbursable_amount": nullable("number"),
+        "non_reimbursable_amount": nullable("number"),
+    },
+    "required": ["verdict", "confidence", "reasoning", "citation_chunk_ids", "reimbursable_amount", "non_reimbursable_amount"],
+    "additionalProperties": False,
+}
+
+
+QA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "confidence": {"type": "number"},
+        "citation_chunk_ids": {"type": "array", "items": {"type": "string"}},
+        "refused": {"type": "boolean"},
+    },
+    "required": ["answer", "confidence", "citation_chunk_ids", "refused"],
+    "additionalProperties": False,
+}
+
+
 class PolicyIndex:
-    def __init__(self, policy_dir: Path):
+    def __init__(self, policy_dir: Path, client: GeminiClient, db_path: Path):
         self.policy_dir = policy_dir
+        self.client = client
+        self.db_path = db_path
         self.chunks: list[dict[str, Any]] = []
+        self.index_error = ""
         self._load()
+        self._init_vector_store()
+        if self.client.configured:
+            try:
+                self._ensure_indexed()
+            except Exception as exc:
+                self.index_error = str(exc)[:240]
+
+    def connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_vector_store(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS policy_documents (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS policy_chunks (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    FOREIGN KEY(document_id) REFERENCES policy_documents(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS policy_embeddings (
+                    chunk_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    embedding_blob BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(chunk_id, model),
+                    FOREIGN KEY(chunk_id) REFERENCES policy_chunks(id) ON DELETE CASCADE
+                );
+                """
+            )
 
     def _load(self) -> None:
         if not self.policy_dir.exists() or PdfReader is None:
@@ -236,143 +392,214 @@ class PolicyIndex:
             self._load_fallback()
 
     def _load_fallback(self) -> None:
-        fallback = {
-            "TEP-002 §2": "Meal expenses incurred by an employee traveling on business are subject to breakfast $25, lunch $35, and dinner $75 per-person caps.",
-            "TEP-003 §2": "Alcoholic beverages are reimbursable only when incurred during sanctioned client entertainment.",
-            "TEP-004 §3": "Maximum reimbursable nightly lodging rate includes room rate plus mandatory taxes and fees.",
-            "TEP-006 §2.3": "Taxis are reimbursable at the metered fare plus reasonable tip up to 20% of the fare.",
-            "TEP-007 §6.1": "Each receipt submitted must match the line item it supports.",
-        }
-        for key, text in fallback.items():
-            doc_id, section = key.split(" §")
-            self.chunks.append(
-                {
-                    "doc_id": doc_id,
-                    "section": section,
-                    "title": doc_id,
-                    "text": text,
-                    "tokens": tokenize(text + " " + doc_id),
-                }
-            )
+        fallback = [
+            ("TEP-002", "fallback-1", "Meal expense caps", "Meal expenses incurred by an employee traveling on business are subject to breakfast $25, lunch $35, and dinner $75 per-person caps."),
+            ("TEP-003", "fallback-2", "Alcohol", "Alcoholic beverages are reimbursable only when incurred during sanctioned client entertainment."),
+            ("TEP-004", "fallback-3", "Lodging", "Maximum reimbursable nightly lodging rate includes room rate plus mandatory taxes and fees."),
+            ("TEP-006", "fallback-4", "Ground transportation", "Taxis are reimbursable at the metered fare plus reasonable tip up to 20% of the fare."),
+            ("TEP-007", "fallback-5", "Receipts", "Each receipt submitted must match the line item it supports."),
+        ]
+        for index, (doc_id, section, title, text) in enumerate(fallback):
+            self._append_chunk("fallback", doc_id, section, title, index, text)
 
     def _chunk_policy_pdf(self, filename: str, text: str) -> None:
-        current_doc = "UNKNOWN"
-        current_title = filename
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        raw_lines = [line.strip() for line in text.splitlines()]
+        doc_id = Path(filename).stem.upper()
+        title = Path(filename).stem
+        paragraphs: list[str] = []
         buffer: list[str] = []
-        section = "intro"
+        for line in raw_lines:
+            if line.lower().startswith("document:"):
+                doc_id = (line.split(":", 1)[1].strip().split() or [doc_id])[0].upper()
+            if not line:
+                if buffer:
+                    paragraphs.append(normalize_text(" ".join(buffer)))
+                    buffer = []
+                continue
+            buffer.append(line)
+        if buffer:
+            paragraphs.append(normalize_text(" ".join(buffer)))
 
-        def flush() -> None:
-            if not buffer:
-                return
-            body = normalize_text(" ".join(buffer)).strip()
-            if len(body) < 40:
-                return
-            self.chunks.append(
-                {
-                    "doc_id": current_doc,
-                    "section": section,
-                    "title": current_title,
-                    "text": body,
-                    "tokens": tokenize(f"{current_doc} {current_title} {body}"),
-                }
+        pending: list[str] = []
+        pending_words = 0
+        chunk_index = 0
+        for paragraph in paragraphs:
+            words = paragraph.split()
+            if len(words) > 650:
+                if pending:
+                    chunk_index = self._flush_policy_chunk(filename, doc_id, title, chunk_index, pending)
+                    pending = []
+                    pending_words = 0
+                for offset in range(0, len(words), 560):
+                    piece = " ".join(words[offset:offset + 650])
+                    chunk_index = self._flush_policy_chunk(filename, doc_id, title, chunk_index, [piece])
+                continue
+            if pending_words + len(words) > 650 and pending:
+                chunk_index = self._flush_policy_chunk(filename, doc_id, title, chunk_index, pending)
+                pending = []
+                pending_words = 0
+            pending.append(paragraph)
+            pending_words += len(words)
+        if pending:
+            self._flush_policy_chunk(filename, doc_id, title, chunk_index, pending)
+
+    def _flush_policy_chunk(self, filename: str, doc_id: str, title: str, chunk_index: int, paragraphs: list[str]) -> int:
+        text = normalize_text("\n".join(paragraphs))
+        if len(text) >= 40:
+            self._append_chunk(filename, doc_id, f"chunk-{chunk_index + 1}", title, chunk_index, text)
+            chunk_index += 1
+        return chunk_index
+
+    def _append_chunk(self, filename: str, doc_id: str, section: str, title: str, chunk_index: int, text: str) -> None:
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        chunk_id = hashlib.sha256(f"{filename}:{chunk_index}:{content_hash}".encode("utf-8")).hexdigest()[:24]
+        self.chunks.append(
+            {
+                "id": chunk_id,
+                "document_id": hashlib.sha256(filename.encode("utf-8")).hexdigest()[:24],
+                "filename": filename,
+                "doc_id": doc_id,
+                "section": section,
+                "title": title,
+                "chunk_index": chunk_index,
+                "text": text,
+                "content_hash": content_hash,
+            }
+        )
+
+    def _ensure_indexed(self) -> None:
+        by_document: dict[str, dict[str, Any]] = {}
+        for chunk in self.chunks:
+            by_document[chunk["document_id"]] = chunk
+        with self.connect() as conn:
+            active_ids = [chunk["id"] for chunk in self.chunks]
+            if active_ids:
+                placeholders = ",".join("?" for _ in active_ids)
+                conn.execute(f"DELETE FROM policy_chunks WHERE id NOT IN ({placeholders})", active_ids)
+            for document_id, chunk in by_document.items():
+                conn.execute(
+                    """
+                    INSERT INTO policy_documents(id, filename, content_hash, indexed_at)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET filename=excluded.filename, content_hash=excluded.content_hash
+                    """,
+                    (document_id, chunk["filename"], chunk["content_hash"], now_iso()),
+                )
+            for chunk in self.chunks:
+                conn.execute(
+                    """
+                    INSERT INTO policy_chunks(id, document_id, doc_id, section, title, chunk_index, text, content_hash)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET text=excluded.text, content_hash=excluded.content_hash
+                    """,
+                    (chunk["id"], chunk["document_id"], chunk["doc_id"], chunk["section"], chunk["title"], chunk["chunk_index"], chunk["text"], chunk["content_hash"]),
+                )
+        for chunk in self.chunks:
+            self._ensure_embedding(chunk)
+
+    def _ensure_embedding(self, chunk: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT chunk_id FROM policy_embeddings WHERE chunk_id=? AND model=?",
+                (chunk["id"], self.client.embedding_model),
+            ).fetchone()
+        if row:
+            return
+        vector = self.client.embed_text(chunk["text"], "RETRIEVAL_DOCUMENT", chunk.get("title", ""))
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO policy_embeddings(chunk_id, model, dimension, embedding_blob, created_at) VALUES(?,?,?,?,?)",
+                (chunk["id"], self.client.embedding_model, len(vector), pack_vector(vector), now_iso()),
             )
 
-        previous = ""
-        for line in lines:
-            doc_match = re.search(r"Document:\s*([A-Z]+-?\d+)", line)
-            if doc_match:
-                flush()
-                buffer = []
-                current_doc = doc_match.group(1)
-                current_title = previous or current_doc
-                section = "intro"
-            sec_match = re.match(r"^(\d+(?:\.\d+){0,2})\.\s+(.*)", line)
-            if sec_match:
-                flush()
-                buffer = [line]
-                section = sec_match.group(1)
-            else:
-                buffer.append(line)
-            previous = line
-        flush()
-
-    def search(self, query: str, limit: int = 5) -> list[Citation]:
-        q_tokens = tokenize(query)
-        if not q_tokens:
+    def retrieve_chunks(self, query: str, limit: int = RETRIEVAL_TOP_K, tracer: StepTracer | None = None) -> list[dict[str, Any]]:
+        tracer = tracer or StepTracer(enabled=False)
+        if not self.client.configured:
+            raise RuntimeError("GEMINI_API_KEY is required for policy retrieval.")
+        if not query.strip():
             return []
-        scored: list[tuple[float, dict[str, Any]]] = []
-        q_set = set(q_tokens)
-        for chunk in self.chunks:
-            tokens = chunk["tokens"]
-            if not tokens:
-                continue
-            overlap = sum(1 for token in tokens if token in q_set)
-            phrase_bonus = sum(3 for token in q_set if token in chunk["text"].lower())
-            score = overlap + phrase_bonus + (4 if chunk["doc_id"].lower() in query.lower() else 0)
-            if score:
-                scored.append((score / (len(tokens) ** 0.45), chunk))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        citations = []
-        for _, chunk in scored[:limit]:
-            quote = chunk["text"]
-            if len(quote) > 420:
-                quote = quote[:417].rsplit(" ", 1)[0] + "..."
-            citations.append(Citation(chunk["doc_id"], chunk["section"], chunk["title"], quote))
-        return citations
+        if not self._has_embeddings():
+            self._ensure_indexed()
+        with tracer.step("embed_query", model_used=self.client.embedding_model) as step:
+            query_vector = self.client.embed_text(query, "RETRIEVAL_QUERY", trace_step=step)
+        with tracer.step("retrieve_policy", model_used=self.client.embedding_model) as step:
+            rows = []
+            with self.connect() as conn:
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT pc.*, pe.embedding_blob
+                        FROM policy_chunks pc
+                        JOIN policy_embeddings pe ON pe.chunk_id=pc.id
+                        WHERE pe.model=?
+                        """,
+                        (self.client.embedding_model,),
+                    )
+                ]
+            scored = []
+            for row in rows:
+                score = cosine_similarity(query_vector, unpack_vector(row.pop("embedding_blob")))
+                row["score"] = score
+                scored.append(row)
+            scored.sort(key=lambda item: item["score"], reverse=True)
+            selected = scored[:limit]
+            step.notes = "retrieved=" + ", ".join(f"{item['doc_id']}:{item['section']}:{item['score']:.3f}" for item in selected)
+            return selected
 
-    def clause(self, doc_id: str, section_prefix: str, fallback_query: str) -> Citation:
-        candidates = [
-            c for c in self.chunks
-            if c["doc_id"] == doc_id and c["section"].startswith(section_prefix)
-        ]
-        if candidates:
-            c = candidates[0]
-            quote = c["text"]
+    def _has_embeddings(self) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM policy_embeddings WHERE model=?", (self.client.embedding_model,)).fetchone()
+            return bool(row and row["count"])
+
+    def citations_from_chunks(self, chunks: list[dict[str, Any]], selected_ids: list[str] | None = None) -> list[Citation]:
+        selected = set(selected_ids or [])
+        output = []
+        for chunk in chunks:
+            if selected and chunk["id"] not in selected:
+                continue
+            quote = chunk["text"]
             if len(quote) > 520:
                 quote = quote[:517].rsplit(" ", 1)[0] + "..."
-            return Citation(c["doc_id"], c["section"], c["title"], quote)
-        found = self.search(fallback_query, 1)
-        return found[0] if found else Citation(doc_id, section_prefix, doc_id, fallback_query)
+            output.append(Citation(chunk["doc_id"], chunk["section"], chunk["title"], quote))
+        return output
 
     def answer(self, question: str) -> dict[str, Any]:
-        in_scope, _scope_matches, scope_step = policy_scope_trace(question)
-        if not in_scope:
+        tracer = StepTracer(enabled=True)
+        try:
+            chunks = self.retrieve_chunks(question, RETRIEVAL_TOP_K, tracer)
+            if not chunks:
+                return {
+                    "answer": "I can only answer questions grounded in the Northwind policy library, and I did not find relevant policy text for that question.",
+                    "confidence": 0.1,
+                    "citations": [],
+                    "refused": True,
+                    "pipeline_trace": tracer.to_list(),
+                }
+            prompt = policy_qa_prompt(question, chunks)
+            with tracer.step("generate_answer", model_used=self.client.generate_model) as step:
+                data = self.client.generate_json(prompt, QA_SCHEMA, step)
+            selected_ids = [str(item) for item in data.get("citation_chunk_ids") or []]
+            citations = self.citations_from_chunks(chunks, selected_ids)
+            refused = bool(data.get("refused")) or not citations
             return {
-                "answer": "This question appears to be outside the scope of Northwind's policy library. I can only answer questions that reference Northwind policies or expense topics.",
-                "confidence": 0.12,
+                "answer": str(data.get("answer") or "I did not find enough policy support to answer that question."),
+                "confidence": clamp(data.get("confidence"), 0.0, 1.0, 0.2),
+                "citations": [] if refused else [citation_to_dict(citation) for citation in citations],
+                "refused": refused,
+                "pipeline_trace": tracer.to_list(),
+            }
+        except Exception as exc:
+            with tracer.step("generate_answer", model_used=self.client.generate_model) as step:
+                step.status = "error"
+                step.notes = str(exc)[:240]
+            return {
+                "answer": "Policy Q&A requires a configured Gemini API key and reachable Gemini service.",
+                "confidence": 0.0,
                 "citations": [],
                 "refused": True,
-                "pipeline_trace": [scope_step],
+                "pipeline_trace": tracer.to_list(),
             }
-        direct = direct_policy_answer(question, self)
-        if direct is not None:
-            direct["pipeline_trace"] = [scope_step]
-            return direct
-        citations = self.search(question, 4)
-        q_tokens = set(tokenize(question))
-        if not citations:
-            return {
-                "answer": "I can only answer questions grounded in the Northwind policy library, and I did not find relevant policy text for that question.",
-                "confidence": 0.1,
-                "citations": [],
-                "refused": True,
-                "pipeline_trace": [scope_step],
-            }
-        best_tokens = set(tokenize(citations[0].quote))
-        overlap = len(q_tokens & best_tokens)
-        sentences = []
-        for citation in citations[:3]:
-            parts = re.split(r"(?<=[.!?])\s+", citation.quote)
-            chosen = max(parts, key=lambda s: len(set(tokenize(s)) & q_tokens), default=citation.quote)
-            sentences.append(f"{citation.doc_id} §{citation.section}: {chosen}")
-        return {
-            "answer": " ".join(sentences),
-            "confidence": min(0.92, 0.45 + 0.08 * overlap),
-            "citations": [citation_to_dict(c) for c in citations],
-            "refused": False,
-            "pipeline_trace": [scope_step],
-        }
 
 
 def citation_to_dict(citation: Citation) -> dict[str, str]:
@@ -404,8 +631,8 @@ def extract_text_receipt(path: Path, trace_step: TraceStep | None = None) -> tup
     if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}:
         text = extract_image_text(path, trace_step)
         if not text:
-            warnings.append("Image OCR unavailable or returned no text. Configure OPENAI_API_KEY or pytesseract for image receipts.")
-        return text, warnings
+            warnings.append("Image OCR unavailable or returned no text. Configure GEMINI_API_KEY or pytesseract for image receipts.")
+        return text or "", warnings
     warnings.append(f"Unsupported receipt type: {suffix}")
     return "", warnings
 
@@ -422,124 +649,163 @@ def extract_image_text(path: Path, trace_step: TraceStep | None = None) -> str:
     except Exception:
         pass
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return ""
     try:
-        image_bytes = path.read_bytes()
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-        model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
-        payload = {
-            "model": model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Extract every visible receipt field as plain text. Preserve totals, dates, merchant name, line items, taxes, tips, and payment method.",
-                        },
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }
-            ],
-        }
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        return GEMINI.generate_text_with_image(
+            path,
+            "Extract every visible receipt field as plain text. Preserve totals, dates, merchant name, line items, taxes, tips, payment method, attendee notes, and any mismatch warnings.",
+            trace_step,
         )
-        context = ssl.create_default_context()
-        with urllib.request.urlopen(request, timeout=45, context=context) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        if trace_step is not None:
-            usage = data.get("usage") or {}
-            input_tokens = int(usage.get("input_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or 0)
-            trace_step.model_used = model
-            trace_step.cost_usd = calculate_model_cost_usd(model, input_tokens, output_tokens)
-            trace_step.notes = f"vision OCR tokens input={input_tokens}, output={output_tokens}"
-        output = []
-        for item in data.get("output", []):
-            for content in item.get("content", []):
-                if content.get("type") in {"output_text", "text"}:
-                    output.append(content.get("text", ""))
-        return "\n".join(output)
     except Exception:
         return ""
 
 
-def parse_amount(text: str) -> float | None:
-    patterns = [
-        r"GRAND\s+TOTAL\s+\$?\s*([0-9,]+\.\d{2})",
-        r"TOTAL\s+CHARGED\s+\$?\s*([0-9,]+\.\d{2})",
-        r"Total\s+Charged\s+\$?\s*([0-9,]+\.\d{2})",
-        r"\bTOTAL\s+\$?\s*([0-9,]+\.\d{2})",
-        r"\bTotal\s+\$?\s*([0-9,]+\.\d{2})",
+def policy_chunks_payload(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": chunk["id"],
+            "doc_id": chunk["doc_id"],
+            "section": chunk["section"],
+            "title": chunk["title"],
+            "text": chunk["text"],
+        }
+        for chunk in chunks
     ]
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.I)
-        if matches:
-            return float(matches[-1].replace(",", ""))
-    amounts = re.findall(r"\$([0-9,]+\.\d{2})", text)
-    if amounts:
-        return float(amounts[-1].replace(",", ""))
-    return None
 
 
-def parse_named_amount(text: str, label: str) -> float | None:
-    match = re.search(r"(?:" + label + r")\s*(?:\([^)]*\))?\s*\$?\s*(-?[0-9,]+\.\d{2})", text, re.I)
-    if not match:
-        return None
-    return float(match.group(1).replace(",", ""))
+def policy_qa_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        [
+            "You answer Northwind policy questions using only the supplied retrieved policy chunks.",
+            "If the question is not about the supplied Northwind policy text, or the chunks do not support an answer, set refused=true and explain that you can only answer from the policy library.",
+            "Cite only chunk_id values that directly support the answer.",
+            "Return JSON matching the schema.",
+            "",
+            "Question:",
+            question,
+            "",
+            "Retrieved policy chunks:",
+            json.dumps(policy_chunks_payload(chunks), ensure_ascii=False, indent=2),
+        ]
+    )
 
 
-def parse_date(text: str) -> str | None:
-    date_patterns = [
-        (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
-        (r"(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})", "%d %b %Y"),
-        (r"([A-Z][a-z]{2},?\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})", "%a, %b %d, %Y"),
-        (r"([A-Z][a-z]{3,9}\s+\d{1,2},\s+\d{4})", "%B %d, %Y"),
-    ]
-    for pattern, fmt in date_patterns:
-        match = re.search(pattern, text)
-        if match:
-            raw = match.group(1).replace(",", "")
-            fmt = fmt.replace(",", "")
-            try:
-                return dt.datetime.strptime(raw, fmt).date().isoformat()
-            except ValueError:
-                continue
-    return None
+def receipt_extraction_prompt(filename: str, text: str, employee: dict[str, Any] | None) -> str:
+    return "\n".join(
+        [
+            "Extract normalized expense receipt facts from the supplied OCR/PDF text.",
+            "Do not use keyword rules. Read the receipt and infer fields from the evidence. Use null for missing fields.",
+            "Choose category from air, lodging, ground, meal, conference, or unknown.",
+            "For confidence, use a 0 to 1 score based on extraction completeness and ambiguity.",
+            "Add warnings for missing amount, missing date, unclear merchant, line-item mismatch, unsupported receipt type, or ambiguous category.",
+            "Return JSON matching the schema.",
+            "",
+            "Filename:",
+            filename,
+            "",
+            "Employee/trip context:",
+            json.dumps(employee or {}, ensure_ascii=False, indent=2),
+            "",
+            "Receipt text:",
+            text[:14000],
+        ]
+    )
 
 
-def detect_city(text: str, employee: dict[str, Any] | None = None) -> str | None:
-    haystack = text.lower()
-    for city in sorted(TIER_1 | TIER_2, key=len, reverse=True):
-        if city in haystack:
-            return city.title()
-    if employee:
-        purpose = str(employee.get("trip_purpose", "")).lower()
-        for city in sorted(TIER_1 | TIER_2, key=len, reverse=True):
-            if city in purpose:
-                return city.title()
-    return None
+def review_retrieval_query(facts: ReceiptFacts, all_facts: list[ReceiptFacts], employee: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "task": "Find Northwind travel and expense policy clauses needed to review this receipt.",
+            "employee": employee,
+            "receipt": facts_to_dict(facts, include_text=True),
+            "submission_receipts": [facts_summary(item) for item in all_facts],
+        },
+        ensure_ascii=False,
+    )
 
 
-def city_tier(city: str | None) -> tuple[str, float]:
-    if not city:
-        return "Tier 3", 175.0
-    normalized = city.lower()
-    if normalized in TIER_1:
-        return "Tier 1", 350.0
-    if normalized in TIER_2:
-        return "Tier 2", 250.0
-    return "Tier 3", 175.0
+def review_prompt(facts: ReceiptFacts, all_facts: list[ReceiptFacts], employee: dict[str, Any], chunks: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        [
+            "You are Northwind's finance expense pre-review engine.",
+            "Use only the employee/trip context, receipt facts, related submission receipts, and retrieved policy chunks supplied below.",
+            "Return a verdict of compliant, flagged, rejected, or needs_review. Flag policy exceptions, reject clearly non-reimbursable expenses, and use needs_review when evidence is insufficient.",
+            "Amounts must be based on receipt facts and policy text. Use null when the reimbursable split cannot be calculated from the provided evidence.",
+            "Cite only chunk_id values from the retrieved policy chunks that directly support the verdict.",
+            "Return JSON matching the schema.",
+            "",
+            "Employee/trip context:",
+            json.dumps(employee, ensure_ascii=False, indent=2),
+            "",
+            "Receipt under review:",
+            json.dumps(facts_to_dict(facts, include_text=True), ensure_ascii=False, indent=2),
+            "",
+            "Other receipts in the same submission:",
+            json.dumps([facts_summary(item) for item in all_facts if item.filename != facts.filename], ensure_ascii=False, indent=2),
+            "",
+            "Retrieved policy chunks:",
+            json.dumps(policy_chunks_payload(chunks), ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def facts_summary(facts: ReceiptFacts) -> dict[str, Any]:
+    return facts_to_dict(facts, include_text=False)
+
+
+def facts_to_dict(facts: ReceiptFacts, include_text: bool = False) -> dict[str, Any]:
+    data = {
+        "filename": facts.filename,
+        "vendor": facts.vendor,
+        "date": facts.date,
+        "category": facts.category,
+        "meal_type": facts.meal_type,
+        "amount": facts.amount,
+        "subtotal": facts.subtotal,
+        "tip": facts.tip,
+        "tax": facts.tax,
+        "nights": facts.nights,
+        "city": facts.city,
+        "confidence": facts.confidence,
+        "warnings": facts.warnings,
+    }
+    if include_text:
+        data["text"] = facts.text[:12000]
+    return data
+
+
+def facts_from_model(filename: str, text: str, data: dict[str, Any], warnings: list[str]) -> ReceiptFacts:
+    model_warnings = [str(item) for item in data.get("warnings") or []]
+    vendor = str(data.get("vendor") or "Unknown merchant")[:120]
+    category = str(data.get("category") or "unknown")
+    if category not in {"air", "lodging", "ground", "meal", "conference", "unknown"}:
+        category = "unknown"
+    meal_type = data.get("meal_type")
+    if meal_type not in {"breakfast", "lunch", "dinner", "snack", "unknown", None}:
+        meal_type = "unknown"
+    return ReceiptFacts(
+        filename=filename,
+        text=text,
+        vendor=vendor or "Unknown merchant",
+        date=str(data.get("date")) if data.get("date") else None,
+        category=category,
+        meal_type=str(meal_type) if meal_type else None,
+        amount=coerce_float(data.get("amount")),
+        subtotal=coerce_float(data.get("subtotal")),
+        tip=coerce_float(data.get("tip")),
+        tax=coerce_float(data.get("tax")),
+        nights=coerce_int(data.get("nights")),
+        city=str(data.get("city")) if data.get("city") else None,
+        confidence=clamp(data.get("confidence"), 0.0, 1.0, 0.45),
+        warnings=warnings + model_warnings,
+    )
+
+
+def fallback_facts(filename: str, text: str, warnings: list[str]) -> ReceiptFacts:
+    combined = list(warnings)
+    if not text:
+        combined.append("No receipt text was extracted.")
+    combined.append("Gemini structured extraction was unavailable, so this receipt requires human review.")
+    return ReceiptFacts(filename=filename, text=text, confidence=0.15, warnings=combined)
 
 
 def parse_receipt(path: Path, employee: dict[str, Any] | None = None, tracer: StepTracer | None = None) -> ReceiptFacts:
@@ -550,299 +816,77 @@ def parse_receipt(path: Path, employee: dict[str, Any] | None = None, tracer: St
             step.status = "degraded"
             step.notes = "; ".join(warnings)[:240]
     text = normalize_text(text)
-    lines = [line.strip() for line in text.splitlines() if line.strip() and set(line.strip()) != {"="}]
-    vendor = "Unknown merchant"
-    for line in lines:
-        if not re.search(r"receipt|confirmation|electronic ticket|^[-=]+$", line, re.I):
-            vendor = line[:80]
-            break
-    amount = parse_amount(text)
-    subtotal = parse_named_amount(text, r"Subtotal|Base Fare")
-    tip = parse_named_amount(text, r"Tip")
-    tax = parse_named_amount(text, r"Tax(?:es)?(?:\s*&\s*Fees)?|State/Local Tax|Occupancy Tax")
-    nights_match = re.search(r"Nights:\s*(\d+)", text, re.I)
-    nights = int(nights_match.group(1)) if nights_match else None
-    with tracer.step("categorize") as step:
-        category = detect_category(path.name, text)
-        meal_type = detect_meal_type(path.name, text) if category == "meal" else None
-        city = detect_city(text, employee)
-        step.notes = f"category={category}" + (f", meal_type={meal_type}" if meal_type else "")
-    confidence = 0.82 if amount and vendor != "Unknown merchant" and text else 0.35
-    facts = ReceiptFacts(
-        filename=path.name,
-        text=text,
-        vendor=vendor,
-        date=parse_date(text),
-        category=category,
-        meal_type=meal_type,
-        amount=amount,
-        subtotal=subtotal,
-        tip=tip,
-        tax=tax,
-        nights=nights,
-        city=city,
-        confidence=confidence,
-        warnings=warnings,
-    )
-    if not text:
-        facts.warnings.append("No receipt text was extracted.")
-    if amount is None:
-        facts.warnings.append("Could not identify a total amount.")
-    if facts.date is None:
-        facts.warnings.append("Could not identify a transaction date.")
-    return facts
-
-
-def detect_category(filename: str, text: str) -> str:
-    probe = f"{filename} {text}".lower()
-    if re.search(r"uber|lyft|taxi|rideshare|driver:|airport surcharge|trip time", probe):
-        return "ground"
-    if re.search(r"hotel|marriott|hilton|hyatt|check-in|check-out|nights:", probe):
-        return "lodging"
-    if re.search(r"airlines|air lines|e-ticket|electronic ticket|flight|itinerary|passenger:|fare breakdown", text, re.I):
-        return "air"
-    if re.search(r"conference registration|registration confirmation|conference pass|workshop add-on|summit registration", probe):
-        return "conference"
-    if re.search(r"breakfast|lunch|dinner|server:|table|grand total|coffee|salad|taco|steak|sushi|barbecue|pancake", probe):
-        return "meal"
-    return "unknown"
-
-
-def detect_meal_type(filename: str, text: str) -> str | None:
-    probe = f"{filename} {text}".lower()
-    for meal in ("breakfast", "lunch", "dinner"):
-        if meal in probe:
-            return meal
-    time_match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", text, re.I)
-    if time_match:
-        hour = int(time_match.group(1)) % 12
-        if time_match.group(3).lower() == "pm":
-            hour += 12
-        if hour < 10:
-            return "breakfast"
-        if hour < 16:
-            return "lunch"
-        return "dinner"
-    return None
-
-
-def alcohol_amount(text: str) -> float:
-    total = 0.0
-    for line in text.splitlines():
-        if any(word in line.lower() for word in ALCOHOL_WORDS):
-            match = re.search(r"\$([0-9]+\.\d{2})", line)
-            if match:
-                total += float(match.group(1))
-    return total
-
-
-def has_external_attendee(text: str, employee: dict[str, Any]) -> bool:
-    probe = f"{text} {employee.get('trip_purpose', '')}".lower()
-    return bool(re.search(r"client|external|prospect|partner attendee|hosted|customer", probe)) and not bool(re.search(r"guest 1 \(of 1\)|solo diner|solo travel", probe))
-
-
-def is_conference_included_meal(facts: ReceiptFacts, all_facts: list[ReceiptFacts], employee: dict[str, Any]) -> bool:
-    if facts.category != "meal" or not facts.meal_type:
-        return False
-    if "conference" not in str(employee.get("trip_purpose", "")).lower():
-        return False
-    registrations = [f for f in all_facts if f.category == "conference"]
-    if not registrations:
-        return False
-    for reg in registrations:
-        text = reg.text.lower()
-        if "includes" not in text:
-            continue
-        if facts.meal_type in text:
-            return True
-    return False
+    with tracer.step("extract_receipt_facts", model_used=GEMINI.generate_model) as step:
+        try:
+            data = GEMINI.generate_json(receipt_extraction_prompt(path.name, text, employee), RECEIPT_FACT_SCHEMA, step)
+            facts = facts_from_model(path.name, text, data, warnings)
+            if facts.amount is None:
+                facts.warnings.append("Could not identify a total amount.")
+            if facts.date is None:
+                facts.warnings.append("Could not identify a transaction date.")
+            step.notes = (step.notes + f"; category={facts.category}, confidence={facts.confidence:.2f}").strip("; ")
+            return facts
+        except Exception as exc:
+            step.status = "error"
+            step.notes = str(exc)[:240]
+            return fallback_facts(path.name, text, warnings)
 
 
 def review_receipt(facts: ReceiptFacts, all_facts: list[ReceiptFacts], employee: dict[str, Any], policy: PolicyIndex, tracer: StepTracer | None = None) -> ReviewResult:
     tracer = tracer or StepTracer(enabled=False)
-    citations: list[Citation] = []
-    confidence = facts.confidence
-    if facts.warnings:
-        with tracer.step("retrieve_policy", model_used="deterministic") as step:
-            citations.append(policy.clause("TEP-007", "2", "Valid receipts must show vendor date total itemized charges and payment method."))
-            step.notes = "resolved receipt requirements clause"
-        with tracer.step("generate_verdict", model_used="deterministic") as step:
-            step.notes = "rule_branch=receipt_warnings"
+    if facts.warnings and facts.confidence < 0.3:
+        return ReviewResult(
+            "needs_review",
+            facts.confidence,
+            "The receipt could not be reliably extracted: " + " ".join(facts.warnings),
+            [],
+            facts.amount,
+            None,
+        )
+    try:
+        chunks = policy.retrieve_chunks(review_retrieval_query(facts, all_facts, employee), RETRIEVAL_TOP_K, tracer)
+    except Exception as exc:
+        with tracer.step("retrieve_policy", model_used=policy.client.embedding_model) as step:
+            step.status = "error"
+            step.notes = str(exc)[:240]
+        return ReviewResult(
+            "needs_review",
+            min(facts.confidence, 0.35),
+            "Policy retrieval requires a configured Gemini API key and reachable Gemini embedding service.",
+            [],
+            facts.amount,
+            None,
+        )
+    with tracer.step("generate_verdict", model_used=policy.client.generate_model) as step:
+        try:
+            data = policy.client.generate_json(review_prompt(facts, all_facts, employee, chunks), REVIEW_SCHEMA, step)
+        except Exception as exc:
+            step.status = "error"
+            step.notes = str(exc)[:240]
             return ReviewResult(
                 "needs_review",
-                min(confidence, 0.42),
-                "The receipt could not be fully extracted: " + " ".join(facts.warnings),
-                citations,
+                min(facts.confidence, 0.35),
+                "Gemini verdict generation failed, so this receipt needs human review.",
+                policy.citations_from_chunks(chunks[:1]),
                 facts.amount,
                 None,
             )
-
-    if facts.category == "meal":
-        return review_meal(facts, all_facts, employee, policy, tracer)
-    if facts.category == "lodging":
-        return review_lodging(facts, policy, tracer)
-    if facts.category == "air":
-        return review_air(facts, policy, tracer)
-    if facts.category == "ground":
-        return review_ground(facts, policy, tracer)
-    if facts.category == "conference":
-        with tracer.step("retrieve_policy", model_used="deterministic") as step:
-            citations.append(policy.clause("TEP-014", "3", "Conference registration fees are reimbursable at the standard attendee rate."))
-            step.notes = "resolved conference registration clause"
-        with tracer.step("generate_verdict", model_used="deterministic") as step:
-            step.notes = "rule_branch=conference"
-            return ReviewResult("compliant", 0.83, "Conference registration appears to be a standard business conference expense.", citations, facts.amount, 0.0)
-
-    with tracer.step("retrieve_policy", model_used="deterministic") as step:
-        citations.append(policy.clause("TEP-001", "3.1", "Every reimbursable expense must have a clear and documented business purpose."))
-        step.notes = "resolved business purpose clause"
-    with tracer.step("generate_verdict", model_used="deterministic") as step:
-        step.notes = "rule_branch=unknown"
-    return ReviewResult("needs_review", 0.48, "The system could not confidently classify this expense category.", citations, facts.amount, None)
-
-
-def review_meal(facts: ReceiptFacts, all_facts: list[ReceiptFacts], employee: dict[str, Any], policy: PolicyIndex, tracer: StepTracer | None = None) -> ReviewResult:
-    tracer = tracer or StepTracer(enabled=False)
-    with tracer.step("retrieve_policy", model_used="deterministic") as step:
-        citations = [
-            policy.clause("TEP-002", "2", "Meal expenses incurred by an employee traveling on business are subject to per person caps."),
-            policy.clause("TEP-007", "3", "Meal expenses require an itemized receipt showing each item ordered."),
-        ]
-        step.notes = "resolved meal cap and itemized receipt clauses"
-    with tracer.step("generate_verdict", model_used="deterministic") as step:
-        step.notes = "rule_branch=meal"
-        amount = facts.amount or 0.0
-        meal = facts.meal_type or "meal"
-        tier, _lodging_cap = city_tier(facts.city)
-        cap = MEAL_CAPS.get(meal, 75.0)
-        if tier == "Tier 1":
-            cap *= 1.25
-
-        alc = alcohol_amount(facts.text)
-        if alc > 0 and not has_external_attendee(facts.text, employee):
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-003", "3.1", "Any alcoholic beverage purchased while traveling on business without external clients present is prohibited."))
-                retrieve_step.notes = "resolved solo alcohol prohibition clause"
-            return ReviewResult(
-                "rejected",
-                0.91,
-                f"Alcohol totaling about {money(alc)} appears on a solo or non-client meal. The food portion may still be reviewed, but the line contains a non-reimbursable alcohol charge.",
-                citations,
-                max(0.0, amount - alc),
-                alc,
-            )
-
-        if is_conference_included_meal(facts, all_facts, employee):
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-014", "5.1", "Where conference registration includes meals, no separate reimbursement is available for those meals."))
-                retrieve_step.notes = "resolved conference-included meal clause"
-            return ReviewResult(
-                "rejected",
-                0.87,
-                f"This {meal} appears separately expensed during a conference whose registration included {meal}.",
-                citations,
-                0.0,
-                amount,
-            )
-
-        if facts.subtotal is not None and facts.tip is not None and facts.tip > max(20.0, facts.subtotal * 0.20):
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-002", "3", "Tips above 20% of the pre-tax meal total are personal and not reimbursable."))
-                retrieve_step.notes = "resolved meal tip cap clause"
-            excess = facts.tip - facts.subtotal * 0.20
-            return ReviewResult("flagged", 0.86, f"Tip appears above the 20% meal cap by {money(excess)}.", citations, amount - excess, excess)
-
-        if amount > cap:
-            excess = amount - cap
-            return ReviewResult(
-                "flagged",
-                0.9,
-                f"{meal.title()} total {money(amount)} exceeds the {tier} reimbursable cap of {money(cap)}.",
-                citations,
-                cap,
-                excess,
-            )
-        return ReviewResult("compliant", 0.88, f"{meal.title()} total {money(amount)} is within the applicable cap of {money(cap)}.", citations, amount, 0.0)
-
-
-def review_lodging(facts: ReceiptFacts, policy: PolicyIndex, tracer: StepTracer | None = None) -> ReviewResult:
-    tracer = tracer or StepTracer(enabled=False)
-    with tracer.step("retrieve_policy", model_used="deterministic") as step:
-        citations = [policy.clause("TEP-004", "3", "Maximum reimbursable nightly lodging rate includes room rate plus mandatory taxes and resort fees.")]
-        step.notes = "resolved lodging cap clause"
-    with tracer.step("generate_verdict", model_used="deterministic") as step:
-        step.notes = "rule_branch=lodging"
-        amount = facts.amount or 0.0
-        nights = facts.nights or 1
-        nightly = amount / max(nights, 1)
-        tier, cap = city_tier(facts.city)
-        issues = []
-        non_reimbursable = 0.0
-        verdict = "compliant"
-        confidence = 0.86
-        if nightly > cap:
-            excess = (nightly - cap) * nights
-            non_reimbursable += excess
-            issues.append(f"nightly rate {money(nightly)} exceeds the {tier} cap of {money(cap)}")
-            verdict = "flagged"
-            confidence = 0.9
-        if re.search(r"outside\s+Concur|no\s+corporate-rate|public rate", facts.text, re.I):
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-004", "2.1", "Lodging should be booked through Concur; bookings outside the tool require manager approval and justification."))
-                retrieve_step.notes = "resolved lodging booking-tool clause"
-            issues.append("receipt notes booking outside Concur/no corporate-rate adjustment")
-            verdict = "flagged"
-            confidence = max(confidence, 0.88)
-        if issues:
-            return ReviewResult(verdict, confidence, "Lodging flagged: " + "; ".join(issues) + ".", citations, max(0.0, amount - non_reimbursable), non_reimbursable)
-        return ReviewResult("compliant", confidence, f"Lodging averages {money(nightly)} per night, within the {tier} cap of {money(cap)}.", citations, amount, 0.0)
-
-
-def review_air(facts: ReceiptFacts, policy: PolicyIndex, tracer: StepTracer | None = None) -> ReviewResult:
-    tracer = tracer or StepTracer(enabled=False)
-    with tracer.step("retrieve_policy", model_used="deterministic") as step:
-        citations = [policy.clause("TEP-005", "2", "Economy is default; premium economy is permitted on segments of 6 hours or more.")]
-        step.notes = "resolved air class of service clause"
-    with tracer.step("generate_verdict", model_used="deterministic") as step:
-        step.notes = "rule_branch=air"
-        text = facts.text.lower()
-        if "first class" in text:
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-005", "2.4", "First class is not reimbursable under any circumstances."))
-                retrieve_step.notes = "resolved first-class prohibition clause"
-            return ReviewResult("rejected", 0.95, "The itinerary appears to include first class service.", citations, 0.0, facts.amount)
-        if "business class" in text and "international" not in text:
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-005", "2.3", "Business class is permitted only on international segments of 10 hours or more with VP approval."))
-                retrieve_step.notes = "resolved business-class approval clause"
-            return ReviewResult("flagged", 0.85, "Business class requires international long-haul context and VP approval.", citations, None, None)
-        if re.search(r"premium select|premium economy|comfort\+", text):
-            durations = [int(h) + int(m) / 60 for h, m in re.findall(r"Duration\s+(\d+)h\s+(\d+)m", facts.text)]
-            if durations and max(durations) < 6:
-                return ReviewResult("flagged", 0.84, "Premium economy appears on a segment under the 6-hour threshold.", citations, None, None)
-        return ReviewResult("compliant", 0.84, "Airfare class and ancillary charges appear consistent with the air travel policy.", citations, facts.amount, 0.0)
-
-
-def review_ground(facts: ReceiptFacts, policy: PolicyIndex, tracer: StepTracer | None = None) -> ReviewResult:
-    tracer = tracer or StepTracer(enabled=False)
-    with tracer.step("retrieve_policy", model_used="deterministic") as step:
-        citations = [policy.clause("TEP-006", "2", "Rideshare services are reimbursable for business-related transportation.")]
-        step.notes = "resolved ground transportation clause"
-    with tracer.step("generate_verdict", model_used="deterministic") as step:
-        step.notes = "rule_branch=ground"
-        text = facts.text.lower()
-        if re.search(r"uber black|lyft lux|premium", text):
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-006", "2.2", "Premium rideshare categories are not reimbursable unless they are the only available option."))
-                retrieve_step.notes = "resolved premium rideshare clause"
-            return ReviewResult("flagged", 0.86, "Receipt appears to use a premium rideshare category.", citations, None, None)
-        if facts.subtotal is not None and facts.tip is not None and facts.tip > facts.subtotal * 0.20 + 0.01:
-            with tracer.step("retrieve_policy", model_used="deterministic") as retrieve_step:
-                citations.append(policy.clause("TEP-006", "2.3", "Taxi tips are reimbursable up to 20% of fare; this limit is used as the rideshare reasonableness guardrail."))
-                retrieve_step.notes = "resolved ground tip cap clause"
-            excess = facts.tip - facts.subtotal * 0.20
-            return ReviewResult("flagged", 0.82, f"Ground transportation tip exceeds 20% by {money(excess)}.", citations, (facts.amount or 0) - excess, excess)
-        return ReviewResult("compliant", 0.86, "Ground transportation appears business-related, standard category, and within tip guidance.", citations, facts.amount, 0.0)
+    verdict = str(data.get("verdict") or "needs_review")
+    if verdict not in {"compliant", "flagged", "rejected", "needs_review"}:
+        verdict = "needs_review"
+    selected_ids = [str(item) for item in data.get("citation_chunk_ids") or []]
+    citations = policy.citations_from_chunks(chunks, selected_ids)
+    if not citations and chunks:
+        verdict = "needs_review"
+        citations = policy.citations_from_chunks(chunks[:1])
+    return ReviewResult(
+        verdict,
+        clamp(data.get("confidence"), 0.0, 1.0, min(facts.confidence, 0.6)),
+        str(data.get("reasoning") or "Gemini did not provide a review rationale."),
+        citations,
+        coerce_float(data.get("reimbursable_amount")),
+        coerce_float(data.get("non_reimbursable_amount")),
+    )
 
 
 class Store:
@@ -1130,7 +1174,8 @@ class Store:
             return dict(row)
 
 
-POLICY = PolicyIndex(CASE_STUDY_DIR / "policies")
+GEMINI = GeminiClient()
+POLICY = PolicyIndex(CASE_STUDY_DIR / "policies", GEMINI, DB_PATH)
 STORE = Store(DB_PATH)
 
 
@@ -1259,7 +1304,14 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/submissions"):
                 return self.send_json({"submissions": STORE.submissions()})
             if self.path.startswith("/api/health"):
-                return self.send_json({"ok": True, "policies": len(POLICY.chunks), "case_study_dir": str(CASE_STUDY_DIR)})
+                return self.send_json({
+                    "ok": True,
+                    "policies": len(POLICY.chunks),
+                    "case_study_dir": str(CASE_STUDY_DIR),
+                    "gemini_configured": GEMINI.configured,
+                    "embedding_model": GEMINI.embedding_model,
+                    "index_error": POLICY.index_error,
+                })
             self.send_error(404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
@@ -1306,7 +1358,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if field_name != "receipts" or not filename:
                 continue
             original_name = Path(filename).name
-            safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", original_name).strip(".-") or f"receipt-{uuid.uuid4().hex}.dat"
+            safe_name = "".join(ch if ch.isalnum() or ch in "_.-" else "-" for ch in original_name).strip(".-") or f"receipt-{uuid.uuid4().hex}.dat"
             target = upload_dir / safe_name
             target.write_bytes(payload)
             paths.append(target)
@@ -1523,6 +1575,25 @@ INDEX_HTML = r"""<!doctype html>
     .trace-error { background: #fdecea; color: var(--bad); }
     .hidden { display: none !important; }
     .spinner { min-height: 28px; color: var(--muted); }
+    .loading-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .loading-dot {
+      width: 18px;
+      height: 18px;
+      border: 2px solid #cbd5e1;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      flex: 0 0 auto;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -1670,7 +1741,7 @@ INDEX_HTML = r"""<!doctype html>
             <span class="status ${esc(s.status)}">${esc(s.status)}</span>
           </div>
           <div class="muted">${esc(s.trip_dates || "")}</div>
-          <div class="muted">${s.item_count} receipts · ${fmtMoney(s.total_amount)} · ${s.issue_count || 0} issues</div>
+          <div class="muted">${s.item_count} receipts Â· ${fmtMoney(s.total_amount)} Â· ${s.issue_count || 0} issues</div>
         </div>
       `).join("") || `<p class="muted">No submissions yet.</p>`;
       document.querySelectorAll(".history-item").forEach(el => el.addEventListener("click", () => openSubmission(el.dataset.id)));
@@ -1693,7 +1764,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row" style="align-items:flex-start">
           <div>
             <h2>${esc(sub.employee_name)}</h2>
-            <div class="muted">${esc(sub.title || "")} · ${esc(sub.department || "")}</div>
+            <div class="muted">${esc(sub.title || "")} Â· ${esc(sub.department || "")}</div>
             <div class="muted">${esc(sub.trip_purpose || "")}</div>
           </div>
           <span class="status ${esc(sub.status)}">${esc(sub.status)}</span>
@@ -1727,11 +1798,11 @@ INDEX_HTML = r"""<!doctype html>
             <span class="status ${esc(item.verdict)}">${esc(item.verdict)}</span>
             <h3 style="margin-top:10px">${esc(item.vendor)}</h3>
             <div class="muted">${esc(item.filename)}</div>
-            <div class="muted">${esc(item.category)} ${item.meal_type ? "· " + esc(item.meal_type) : ""}</div>
+            <div class="muted">${esc(item.category)} ${item.meal_type ? "Â· " + esc(item.meal_type) : ""}</div>
           </div>
           <div>
             <p>${esc(item.reasoning)}</p>
-            ${(item.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} §${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
+            ${(item.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} Â§${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
             <details class="trace">
               <summary>Pipeline trace</summary>
               ${traceRows || `<div class="trace-row"><span class="muted">No trace recorded for this item.</span></div>`}
@@ -1793,16 +1864,29 @@ INDEX_HTML = r"""<!doctype html>
     async function askQuestion() {
       const question = $("questionInput").value.trim();
       if (!question) return;
-      const data = await api("/api/policy-question", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({question})
-      });
+      $("askBtn").disabled = true;
       $("answerBox").innerHTML = `
-        <p>${esc(data.answer)}</p>
-        <div class="muted">Confidence ${Math.round(Number(data.confidence || 0) * 100)}%${data.refused ? " · refused" : ""}</div>
-        ${(data.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} §${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
+        <div class="loading-row" role="status" aria-live="polite">
+          <span class="loading-dot" aria-hidden="true"></span>
+          <span>Generating answer...</span>
+        </div>
       `;
+      try {
+        const data = await api("/api/policy-question", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({question})
+        });
+        $("answerBox").innerHTML = `
+          <p>${esc(data.answer)}</p>
+          <div class="muted">Confidence ${Math.round(Number(data.confidence || 0) * 100)}%${data.refused ? " Â· refused" : ""}</div>
+          ${(data.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} Â§${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
+        `;
+      } catch (err) {
+        $("answerBox").innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+      } finally {
+        $("askBtn").disabled = false;
+      }
     }
 
     document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {

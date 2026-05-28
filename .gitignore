@@ -11,4 +11,5 @@ venv/
 after_metrics*.txt
 before_metrics.txt
 metrics*.json
+server*.log
 

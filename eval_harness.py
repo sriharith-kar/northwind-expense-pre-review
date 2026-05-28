@@ -224,10 +224,10 @@ def evaluate_operational_metrics(base_url: str, expected: dict[str, Any], case_d
         "mean_cost_usd_per_submission": total_cost / len(submission_costs) if submission_costs else 0.0,
         "mean_cost_usd_per_receipt": total_cost / receipt_count if receipt_count else 0.0,
         "schema_validation_failure_rate": schema_validation_failure_rate(all_items),
-        "schema_validation_failure_rate_note": "schema validation pressure is bounded by deterministic dataclass construction; no failures were fabricated.",
+        "schema_validation_failure_rate_note": "schema validation pressure is bounded by structured Gemini output plus deterministic coercion; no failures were fabricated.",
         "refusal_rate_on_out_of_scope_queries": refusal_rate,
         "retrieval_recall_at_k": None,
-        "retrieval_recall_at_k_note": "retrieval_recall_at_k: skipped - deterministic clause resolution; covered by citation_coverage.",
+        "retrieval_recall_at_k_note": "retrieval_recall_at_k: skipped - add expected citation chunk IDs to fixtures to score vector retrieval directly.",
     }
 
 

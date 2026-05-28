@@ -9,14 +9,15 @@ from typing import Any, Literal
 TraceStatus = Literal["ok", "retried", "fallback", "degraded", "error"]
 
 
-# Pricing is centralized so production deployments can swap in provider-specific
-# rates. OpenAI model rates below are from the official OpenAI API model/pricing
-# pages checked on 2026-05-27: gpt-4o-mini $0.15 input / $0.60 output per 1M
-# tokens; gpt-4o $2.50 input / $10.00 output per 1M tokens.
+# Pricing is centralized so deployments can swap in provider-specific rates.
+# Gemini entries default to zero unless explicit rates are added, which avoids
+# silently presenting stale pricing as an audited cost.
 MODEL_COST_PER_1K_TOKENS_USD: dict[str, dict[str, float]] = {
     "n/a": {"input": 0.0, "output": 0.0},
     "deterministic": {"input": 0.0, "output": 0.0},
     "pytesseract": {"input": 0.0, "output": 0.0},
+    "gemini-2.5-flash": {"input": 0.0, "output": 0.0},
+    "gemini-embedding-001": {"input": 0.0, "output": 0.0},
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
     "gpt-4o": {"input": 0.0025, "output": 0.01},
 }
