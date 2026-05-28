@@ -1215,37 +1215,63 @@ def process_submission(employee: dict[str, Any], receipt_paths: list[Path], sour
         if existing:
             detail = STORE.submission_detail(existing)
             items = detail.get("items", []) if detail else []
-            has_complete_trace = bool(items) and all(item.get("pipeline_trace") for item in items)
+            has_expected_items = len(items) == len(receipt_paths)
+            has_complete_trace = has_expected_items and all(item.get("pipeline_trace") for item in items)
             has_trace_errors = any(
                 step.get("status") == "error"
                 for item in items
                 for step in item.get("pipeline_trace", [])
             )
-            if has_complete_trace and not has_trace_errors:
+            is_finalized = bool(detail and detail.get("status") != "processing")
+            if is_finalized and has_complete_trace and not has_trace_errors:
                 return existing
             STORE.delete_submission(existing)
     sid = STORE.create_submission(employee["employee_id"], employee.get("trip_purpose", ""), employee.get("trip_dates", ""), source_key)
-    tracers = [StepTracer(enabled=True) for _ in receipt_paths]
-    facts_list = [parse_receipt(path, employee, tracer) for path, tracer in zip(receipt_paths, tracers)]
-    dest_dir = UPLOAD_DIR / sid
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    for path, facts, tracer in zip(receipt_paths, facts_list, tracers):
-        saved = dest_dir / path.name
-        if path.resolve() != saved.resolve():
-            shutil.copy2(path, saved)
-        result = review_receipt(facts, facts_list, employee, POLICY, tracer)
-        with tracer.step("schema_validate", model_used="deterministic") as step:
-            if not result.verdict or not result.reasoning:
-                step.status = "error"
-                step.notes = "Missing required verdict fields."
-            else:
-                step.notes = "ReviewResult dataclass fields present."
-        with tracer.step("confidence_check", model_used="deterministic") as step:
-            step.notes = f"confidence={result.confidence:.2f}"
-            if result.confidence < 0.5:
-                step.status = "degraded"
-        STORE.add_line_item(sid, facts, result, saved, tracer.to_list())
-    STORE.finalize_submission(sid)
+    try:
+        tracers = [StepTracer(enabled=True) for _ in receipt_paths]
+        facts_list: list[ReceiptFacts] = []
+        for path, tracer in zip(receipt_paths, tracers):
+            try:
+                facts_list.append(parse_receipt(path, employee, tracer))
+            except Exception as exc:
+                with tracer.step("extract_receipt_facts", model_used=GEMINI.generate_model) as step:
+                    step.status = "error"
+                    step.notes = str(exc)[:240]
+                facts_list.append(fallback_facts(path.name, "", [f"Receipt extraction failed: {exc}"]))
+
+        dest_dir = UPLOAD_DIR / sid
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for path, facts, tracer in zip(receipt_paths, facts_list, tracers):
+            saved = dest_dir / path.name
+            try:
+                if path.resolve() != saved.resolve():
+                    shutil.copy2(path, saved)
+                result = review_receipt(facts, facts_list, employee, POLICY, tracer)
+            except Exception as exc:
+                with tracer.step("generate_verdict", model_used=GEMINI.generate_model) as step:
+                    step.status = "error"
+                    step.notes = str(exc)[:240]
+                result = ReviewResult(
+                    "needs_review",
+                    min(facts.confidence, 0.25),
+                    f"The receipt could not be fully reviewed because processing failed: {exc}",
+                    [],
+                    facts.amount,
+                    None,
+                )
+            with tracer.step("schema_validate", model_used="deterministic") as step:
+                if not result.verdict or not result.reasoning:
+                    step.status = "error"
+                    step.notes = "Missing required verdict fields."
+                else:
+                    step.notes = "ReviewResult dataclass fields present."
+            with tracer.step("confidence_check", model_used="deterministic") as step:
+                step.notes = f"confidence={result.confidence:.2f}"
+                if result.confidence < 0.5:
+                    step.status = "degraded"
+            STORE.add_line_item(sid, facts, result, saved, tracer.to_list())
+    finally:
+        STORE.finalize_submission(sid)
     return sid
 
 
