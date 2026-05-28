@@ -14,6 +14,7 @@ import ssl
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", GEMINI_MODEL)
 GEMINI_EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
 RETRIEVAL_TOP_K = int(os.environ.get("NORTHWIND_RETRIEVAL_TOP_K", "6"))
+GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "4"))
 
 
 def now_iso() -> str:
@@ -161,15 +163,31 @@ class GeminiClient:
     def _request(self, endpoint: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
         if not self.configured:
             raise RuntimeError("GEMINI_API_KEY is not configured.")
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-            method="POST",
-        )
+        body = json.dumps(payload).encode("utf-8")
         context = ssl.create_default_context()
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-            return json.loads(response.read().decode("utf-8"))
+        transient_statuses = {429, 500, 502, 503, 504}
+        last_error = ""
+        for attempt in range(max(1, GEMINI_MAX_RETRIES)):
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", "replace")[:500]
+                last_error = f"HTTP Error {exc.code}: {exc.reason}. {error_body}".strip()
+                if exc.code not in transient_statuses or attempt == GEMINI_MAX_RETRIES - 1:
+                    raise RuntimeError(last_error) from exc
+            except urllib.error.URLError as exc:
+                last_error = f"Gemini request failed: {exc.reason}"
+                if attempt == GEMINI_MAX_RETRIES - 1:
+                    raise RuntimeError(last_error) from exc
+            time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+        raise RuntimeError(last_error or "Gemini request failed.")
 
     def _set_usage(self, step: TraceStep | None, model: str, data: dict[str, Any]) -> None:
         if step is None:
@@ -1196,7 +1214,14 @@ def process_submission(employee: dict[str, Any], receipt_paths: list[Path], sour
         existing = STORE.source_submission(source_key)
         if existing:
             detail = STORE.submission_detail(existing)
-            if detail and detail.get("items") and all(item.get("pipeline_trace") for item in detail.get("items", [])):
+            items = detail.get("items", []) if detail else []
+            has_complete_trace = bool(items) and all(item.get("pipeline_trace") for item in items)
+            has_trace_errors = any(
+                step.get("status") == "error"
+                for item in items
+                for step in item.get("pipeline_trace", [])
+            )
+            if has_complete_trace and not has_trace_errors:
                 return existing
             STORE.delete_submission(existing)
     sid = STORE.create_submission(employee["employee_id"], employee.get("trip_purpose", ""), employee.get("trip_dates", ""), source_key)
@@ -1741,7 +1766,7 @@ INDEX_HTML = r"""<!doctype html>
             <span class="status ${esc(s.status)}">${esc(s.status)}</span>
           </div>
           <div class="muted">${esc(s.trip_dates || "")}</div>
-          <div class="muted">${s.item_count} receipts Â· ${fmtMoney(s.total_amount)} Â· ${s.issue_count || 0} issues</div>
+          <div class="muted">${s.item_count} receipts &middot; ${fmtMoney(s.total_amount)} &middot; ${s.issue_count || 0} issues</div>
         </div>
       `).join("") || `<p class="muted">No submissions yet.</p>`;
       document.querySelectorAll(".history-item").forEach(el => el.addEventListener("click", () => openSubmission(el.dataset.id)));
@@ -1764,7 +1789,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row" style="align-items:flex-start">
           <div>
             <h2>${esc(sub.employee_name)}</h2>
-            <div class="muted">${esc(sub.title || "")} Â· ${esc(sub.department || "")}</div>
+            <div class="muted">${esc(sub.title || "")} &middot; ${esc(sub.department || "")}</div>
             <div class="muted">${esc(sub.trip_purpose || "")}</div>
           </div>
           <span class="status ${esc(sub.status)}">${esc(sub.status)}</span>
@@ -1798,11 +1823,11 @@ INDEX_HTML = r"""<!doctype html>
             <span class="status ${esc(item.verdict)}">${esc(item.verdict)}</span>
             <h3 style="margin-top:10px">${esc(item.vendor)}</h3>
             <div class="muted">${esc(item.filename)}</div>
-            <div class="muted">${esc(item.category)} ${item.meal_type ? "Â· " + esc(item.meal_type) : ""}</div>
+            <div class="muted">${esc(item.category)} ${item.meal_type ? "&middot; " + esc(item.meal_type) : ""}</div>
           </div>
           <div>
             <p>${esc(item.reasoning)}</p>
-            ${(item.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} Â§${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
+            ${(item.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} &sect;${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
             <details class="trace">
               <summary>Pipeline trace</summary>
               ${traceRows || `<div class="trace-row"><span class="muted">No trace recorded for this item.</span></div>`}
@@ -1879,8 +1904,8 @@ INDEX_HTML = r"""<!doctype html>
         });
         $("answerBox").innerHTML = `
           <p>${esc(data.answer)}</p>
-          <div class="muted">Confidence ${Math.round(Number(data.confidence || 0) * 100)}%${data.refused ? " Â· refused" : ""}</div>
-          ${(data.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} Â§${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
+          <div class="muted">Confidence ${Math.round(Number(data.confidence || 0) * 100)}%${data.refused ? " &middot; refused" : ""}</div>
+          ${(data.citations || []).map(c => `<div class="citation"><strong>${esc(c.doc_id)} &sect;${esc(c.section)}</strong><br>${esc(c.quote)}</div>`).join("")}
         `;
       } catch (err) {
         $("answerBox").innerHTML = `<p class="muted">${esc(err.message)}</p>`;

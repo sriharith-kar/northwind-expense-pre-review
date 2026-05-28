@@ -31,3 +31,5 @@ services:
         value: gemini-embedding-001
       - key: NORTHWIND_RETRIEVAL_TOP_K
         value: 6
+      - key: GEMINI_MAX_RETRIES
+        value: 4

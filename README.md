@@ -70,6 +70,7 @@ GEMINI_MODEL=gemini-2.5-flash
 GEMINI_VISION_MODEL=gemini-2.5-flash
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 NORTHWIND_RETRIEVAL_TOP_K=6
+GEMINI_MAX_RETRIES=4
 ```
 
 4. Start the app:
@@ -93,6 +94,7 @@ GEMINI_MODEL=gemini-2.5-flash
 GEMINI_VISION_MODEL=gemini-2.5-flash
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 NORTHWIND_RETRIEVAL_TOP_K=6
+GEMINI_MAX_RETRIES=4
 ```
 
 Without `GEMINI_API_KEY`, the server still starts, but receipt review falls back to `needs_review` and policy Q&A refuses rather than fabricating.
@@ -154,6 +156,7 @@ flowchart LR
    - Gemini receives the extracted facts, employee/trip context, related receipts, and retrieved policy chunks.
    - It returns a schema-constrained verdict with confidence, reasoning, reimbursable amount, non-reimbursable amount, and supporting chunk IDs.
    - The app validates verdict enums and requires citation support. Weak outputs route to `needs_review`.
+   - Transient Gemini errors such as 429/500/502/503/504 are retried with exponential backoff before the item falls back to human review.
 
 6. **Persistence and audit**
    - Submissions, line items, citations, extracted text, overrides, and pipeline traces are stored in SQLite.
