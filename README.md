@@ -15,7 +15,7 @@ The system is intentionally a pre-review tool, not an auto-approver. It highligh
 - Verified health state: `ok: true`, `gemini_configured: true`, `embedding_ready: true`, `index_error: ""`
 - Verified policy index: 43 policy chunks and 43 ready embeddings
 
-Render is the only active deployment target for this repo. Vercel is no longer connected to the repository, and old Vercel GitHub deployment records have been removed.
+Render is the only active deployment target for this repo.
 
 ## How To Use The App
 
@@ -152,8 +152,6 @@ https://<your-render-service>.onrender.com/api/health
 ```
 
 A healthy deployment returns `ok: true`, `gemini_configured: true`, `embedding_ready: true`, and an empty `index_error`.
-
-This project should not be deployed to Vercel in its current form. Vercel serverless deployments do not match the app's long-running stdlib server, local SQLite persistence, uploaded receipt storage, and policy-vector cache. The repository has been cleaned up so Render is the deployment source of record.
 
 ## Architecture
 
