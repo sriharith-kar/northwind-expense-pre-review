@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: northwind-expense-pre-review
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python northwind_app.py
+    healthCheckPath: /api/health
+    disk:
+      name: northwind-data
+      mountPath: /opt/render/project/src/render_data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: HOST
+        value: 0.0.0.0
+      - key: NORTHWIND_DB
+        value: /opt/render/project/src/render_data/northwind.sqlite
+      - key: NORTHWIND_UPLOADS
+        value: /opt/render/project/src/render_data/runtime_uploads
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_VISION_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: NORTHWIND_RETRIEVAL_TOP_K
+        value: 6

@@ -36,6 +36,20 @@ GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 NORTHWIND_RETRIEVAL_TOP_K=6
 ```
 
+## Deploy On Render
+
+This repo includes `render.yaml` for a Render Blueprint deployment. Create a new Blueprint in Render from the GitHub repo and branch `main`; Render will use:
+
+- Build command: `pip install -r requirements.txt`
+- Start command: `python northwind_app.py`
+- Health check: `/api/health`
+- Runtime: Python `3.13.5`
+- Persistent disk: `/opt/render/project/src/render_data`
+
+Set `GEMINI_API_KEY` in the Render Blueprint/environment prompt. Do not commit the local `.env` file.
+
+The Blueprint uses Render's `starter` plan because SQLite, uploaded receipts, and policy embeddings need persistent disk storage. Render's free web service filesystem is ephemeral, so it is not a good fit for preserving reviewer history.
+
 ## Architecture
 
 ```mermaid
