@@ -353,11 +353,6 @@ class PolicyIndex:
         self.index_error = ""
         self._load()
         self._init_vector_store()
-        if self.client.configured:
-            try:
-                self._ensure_indexed()
-            except Exception as exc:
-                self.index_error = str(exc)[:240]
 
     def connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,6 +564,11 @@ class PolicyIndex:
         with self.connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS count FROM policy_embeddings WHERE model=?", (self.client.embedding_model,)).fetchone()
             return bool(row and row["count"])
+
+    def embedding_count(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM policy_embeddings WHERE model=?", (self.client.embedding_model,)).fetchone()
+            return int(row["count"] if row else 0)
 
     def citations_from_chunks(self, chunks: list[dict[str, Any]], selected_ids: list[str] | None = None) -> list[Citation]:
         selected = set(selected_ids or [])
@@ -1329,12 +1329,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/submissions"):
                 return self.send_json({"submissions": STORE.submissions()})
             if self.path.startswith("/api/health"):
+                embedding_count = POLICY.embedding_count()
                 return self.send_json({
                     "ok": True,
                     "policies": len(POLICY.chunks),
                     "case_study_dir": str(CASE_STUDY_DIR),
                     "gemini_configured": GEMINI.configured,
                     "embedding_model": GEMINI.embedding_model,
+                    "embedding_count": embedding_count,
+                    "embedding_ready": embedding_count >= len(POLICY.chunks),
                     "index_error": POLICY.index_error,
                 })
             self.send_error(404)
