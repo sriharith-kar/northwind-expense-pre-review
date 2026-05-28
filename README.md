@@ -6,7 +6,7 @@ The system is intentionally a pre-review tool, not an auto-approver. It highligh
 
 ## Live Deployment
 
-The repository includes a Render Blueprint in `render.yaml`. Deploy it from Render against the `main` branch and provide `GEMINI_API_KEY` when prompted.
+The application is deployed on Render from the `main` branch. The repository includes a Render Blueprint in `render.yaml`; provide `GEMINI_API_KEY` in Render environment settings when deploying or redeploying.
 
 The Blueprint configures:
 
@@ -16,6 +16,16 @@ The Blueprint configures:
 - Health check: `/api/health`
 - Persistent disk for SQLite, uploads, and policy embeddings
 - Gemini model defaults: `gemini-2.5-flash` and `gemini-embedding-001`
+
+Verify a deployment by opening:
+
+```text
+https://<your-render-service>.onrender.com/api/health
+```
+
+A healthy deployment returns `ok: true`, `gemini_configured: true`, `embedding_ready: true`, and an empty `index_error`. The current deployment has been verified with 43 loaded policy chunks and 43 ready embeddings.
+
+Render is the supported deployment target for this repo. Vercel is intentionally not used because the app needs a long-running Python service plus persistent SQLite/uploads; any old Vercel GitHub deployment history can be ignored or removed separately.
 
 ## What Reviewers Can Do
 
@@ -110,6 +120,8 @@ The Render Blueprint is checked in as `render.yaml`.
 5. Deploy.
 
 The Blueprint uses the `starter` plan because this app uses SQLite, uploaded receipts, and policy embeddings. Render's free filesystem is ephemeral; preserving reviewer history requires a persistent disk.
+
+This project should not be deployed to Vercel in its current form. Vercel serverless deployments do not match the app's long-running stdlib server, local SQLite persistence, uploaded receipt storage, and policy-vector cache.
 
 ## Architecture
 
