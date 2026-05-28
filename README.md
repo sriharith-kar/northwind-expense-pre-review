@@ -4,57 +4,70 @@ Northwind Expense Pre-Review is a browser-based AI-assisted finance review tool 
 
 The system is intentionally a pre-review tool, not an auto-approver. It highlights what looks compliant, what appears to violate policy, and what is ambiguous enough to need a human eye.
 
-## Live Deployment
+## Current Status
 
-The application is deployed on Render from the `main` branch. The repository includes a Render Blueprint in `render.yaml`; provide `GEMINI_API_KEY` in Render environment settings when deploying or redeploying.
+- Deployment target: Render
+- Source branch: `main`
+- Model: `gemini-2.5-flash`
+- Embeddings: `gemini-embedding-001`
+- Persistence: SQLite on Render persistent disk
+- Health endpoint: `/api/health`
+- Verified health state: `ok: true`, `gemini_configured: true`, `embedding_ready: true`, `index_error: ""`
+- Verified policy index: 43 policy chunks and 43 ready embeddings
 
-The Blueprint configures:
-
-- Python web service
-- Build command: `pip install -r requirements.txt`
-- Start command: `python northwind_app.py`
-- Health check: `/api/health`
-- Persistent disk for SQLite, uploads, and policy embeddings
-- Gemini model defaults: `gemini-2.5-flash` and `gemini-embedding-001`
-
-Verify a deployment by opening:
-
-```text
-https://<your-render-service>.onrender.com/api/health
-```
-
-A healthy deployment returns `ok: true`, `gemini_configured: true`, `embedding_ready: true`, and an empty `index_error`. The current deployment has been verified with 43 loaded policy chunks and 43 ready embeddings.
-
-Render is the supported deployment target for this repo. Vercel is intentionally not used because the app needs a long-running Python service plus persistent SQLite/uploads; any old Vercel GitHub deployment history can be ignored or removed separately.
-
-## What Reviewers Can Do
-
-- Start a new expense submission from a normal browser.
-- Pick one of the five seeded sample employees loaded from `case_study/submissions/*/employee_info.json`.
-- Create a new employee with identity, grade, department, and trip context.
-- Upload mixed receipt formats: PDF, text, and image files.
-- See one pre-review result per receipt line item.
-- Review extracted vendor, date, category, amount, verdict, confidence, reasoning, and quoted policy support.
-- Visually distinguish compliant, flagged, rejected, and needs-review items.
-- Override any system verdict with a required comment.
-- Reopen historical submissions after restart because state is persisted in SQLite.
-- Ask ad-hoc policy questions and receive grounded cited answers, or a refusal when the question is outside the policy library.
+Render is the supported deployment target for this repo. Vercel is intentionally not used because the app needs a long-running Python service plus persistent SQLite/uploads; old Vercel deployment history in GitHub can be ignored or removed separately.
 
 ## How To Use The App
 
-1. Open the app in a browser.
-2. In the `New` tab, select a seeded employee or create a new employee.
-3. Confirm or enter the trip purpose and trip dates. Trip context matters for some policy decisions.
-4. Upload one or more receipts.
+1. Open the deployed Render URL in a browser.
+2. In the `New` tab, select one of the seeded employees or create a new employee.
+3. Confirm or enter the employee identity, grade, department, trip purpose, and trip dates.
+4. Upload one or more receipts. The app accepts PDF, text, and common image formats.
 5. Click `Run pre-review`.
-6. Review each line item:
-   - `compliant` means the system found no policy issue in the supplied evidence.
-   - `flagged` means the item may be reimbursable in part or may need reviewer attention.
-   - `rejected` means the supplied evidence indicates a clearly non-reimbursable issue.
-   - `needs_review` means extraction, retrieval, citation support, or confidence was not strong enough.
-7. Use the override controls when the finance reviewer disagrees with the system. Overrides are appended to the audit log and do not erase the original verdict.
-8. Use `History` to reopen prior submissions.
-9. Use `Policy Q&A` to ask questions about Northwind policies. The answer area shows a loading indicator while Gemini is generating the response.
+6. Review each receipt line item:
+   - `compliant`: no policy issue was found in the supplied evidence.
+   - `flagged`: the item may be partially reimbursable or needs reviewer attention.
+   - `rejected`: the evidence supports a clearly non-reimbursable issue.
+   - `needs_review`: extraction, retrieval, citation support, or confidence was not strong enough.
+7. Expand `Pipeline trace` to see OCR, extraction, retrieval, verdict, validation, latency, and model-call status.
+8. Override any verdict with a required comment when the reviewer disagrees. Overrides are appended to the audit log and do not erase the original verdict.
+9. Use `History` to reopen previous submissions after restart.
+10. Use `Policy Q&A` to ask questions about Northwind policies. Answers cite retrieved policy text or refuse unsupported/out-of-scope questions.
+
+## Key Features
+
+- Browser workflow for finance reviewers.
+- Five sample employees seeded automatically from the provided `case_study/submissions/*/employee_info.json` files.
+- New employee creation for additional trip contexts.
+- Mixed receipt upload support for PDF, text, and image receipts.
+- Gemini structured extraction for vendor, date, category, amount, tax, tip, city, meal type, nights, confidence, and warnings.
+- Gemini embedding retrieval over policy chunks stored in SQLite.
+- Gemini structured verdict generation with schema validation.
+- Quoted policy citations displayed with every supported verdict.
+- Visual status badges for `compliant`, `flagged`, `rejected`, and `needs_review`.
+- Append-only reviewer overrides with required comments.
+- Persisted submission history, line items, citations, extracted text, overrides, and pipeline traces.
+- Policy Q&A with grounded answers and refusal behavior.
+- Evaluation harness for held-out expected outcomes.
+- Render Blueprint deployment with persistent disk.
+
+## Candidate Brief Coverage
+
+| Candidate brief capability | Implementation |
+| --- | --- |
+| Browser-based reviewer workflow | Single-page HTML/CSS/JS UI served by the Python app |
+| Start a new submission | `New` tab supports seeded employees or newly created employees |
+| Seed employees from sample data | `seed_employees()` loads the five provided employee JSON files at startup |
+| Upload mixed receipt formats | PDF, text, and common image formats are accepted |
+| Extract line-item facts | Gemini structured extraction from receipt text/OCR |
+| Show category, verdict, reasoning, confidence | Rendered per line item in the review workspace |
+| Quote supporting policy clauses | Retrieved policy chunk quotes are stored and displayed |
+| Visually distinguish flagged items | Status badges and colors distinguish outcomes |
+| Reviewer override with comment | Required comments are persisted as an audit log |
+| Browse history after restart | SQLite persistence for employees, submissions, items, and overrides |
+| Policy Q&A with grounded answers/refusals | RAG answer generation cites chunks or refuses unsupported questions |
+| Evaluation harness | `eval_harness.py` accepts expected outcomes JSON and reports metrics |
+| Live deployed URL | Render Blueprint in `render.yaml` |
 
 ## Run Locally
 
@@ -119,7 +132,26 @@ The Render Blueprint is checked in as `render.yaml`.
 4. Enter `GEMINI_API_KEY` when Render prompts for unsynced environment variables.
 5. Deploy.
 
-The Blueprint uses the `starter` plan because this app uses SQLite, uploaded receipts, and policy embeddings. Render's free filesystem is ephemeral; preserving reviewer history requires a persistent disk.
+The Blueprint configures:
+
+- Python web service
+- Build command: `pip install -r requirements.txt`
+- Start command: `python northwind_app.py`
+- Health check: `/api/health`
+- Persistent disk mounted at `/opt/render/project/src/render_data`
+- `HOST=0.0.0.0`
+- `NORTHWIND_DB=/opt/render/project/src/render_data/northwind.sqlite`
+- `NORTHWIND_UPLOADS=/opt/render/project/src/render_data/runtime_uploads`
+
+The Blueprint uses the `starter` plan because SQLite, uploaded receipts, and policy embeddings require persistent disk. Render's free filesystem is ephemeral and is not a good fit for preserving reviewer history.
+
+Verify a deployment by opening:
+
+```text
+https://<your-render-service>.onrender.com/api/health
+```
+
+A healthy deployment returns `ok: true`, `gemini_configured: true`, `embedding_ready: true`, and an empty `index_error`.
 
 This project should not be deployed to Vercel in its current form. Vercel serverless deployments do not match the app's long-running stdlib server, local SQLite persistence, uploaded receipt storage, and policy-vector cache.
 
@@ -143,13 +175,14 @@ flowchart LR
   QA --> Browser
 ```
 
-## Pipeline
+## Processing Pipeline
 
 1. **Startup**
    - Loads `.env` if present.
    - Seeds employees from the provided sample submission folders.
    - Extracts and chunks policy PDFs.
-   - Builds or reuses SQLite-stored Gemini embeddings for policy chunks when `GEMINI_API_KEY` is configured.
+   - Reuses existing SQLite-stored Gemini embeddings when present.
+   - Avoids Gemini indexing during startup so Render cold starts remain fast; missing embeddings are built lazily on first retrieval.
 
 2. **Receipt ingestion**
    - PDF receipts are extracted with `pypdf`.
@@ -157,38 +190,22 @@ flowchart LR
    - Image receipts try local `pytesseract`; if unavailable, Gemini vision extracts visible receipt text.
 
 3. **Structured extraction**
-   - Gemini returns schema-constrained receipt facts: vendor, date, category, meal type, amount, subtotal, tip, tax, nights, city, confidence, and warnings.
+   - Gemini returns schema-constrained receipt facts.
    - Missing or malformed extraction fields are coerced into safe nullable values.
 
 4. **Retrieval**
-   - The receipt facts, trip context, and related receipts are embedded as a retrieval query.
-   - The app retrieves the top policy chunks from SQLite by cosine similarity.
+   - Receipt facts, trip context, and related receipts are embedded as a retrieval query.
+   - The app retrieves top policy chunks from SQLite by cosine similarity.
 
 5. **Verdict generation**
    - Gemini receives the extracted facts, employee/trip context, related receipts, and retrieved policy chunks.
    - It returns a schema-constrained verdict with confidence, reasoning, reimbursable amount, non-reimbursable amount, and supporting chunk IDs.
    - The app validates verdict enums and requires citation support. Weak outputs route to `needs_review`.
-   - Transient Gemini errors such as 429/500/502/503/504 are retried with exponential backoff before the item falls back to human review.
+   - Transient Gemini errors such as 429/500/502/503/504 are retried with exponential backoff before fallback.
 
 6. **Persistence and audit**
    - Submissions, line items, citations, extracted text, overrides, and pipeline traces are stored in SQLite.
    - Overrides are append-only comments attached to line items.
-
-## Feature Coverage
-
-| Candidate brief capability | Implementation |
-| --- | --- |
-| Browser-based reviewer workflow | Single-page HTML/CSS/JS UI served by the Python app |
-| Seed employees from sample data | `seed_employees()` loads the five provided employee JSON files at startup |
-| Upload mixed receipt formats | PDF, text, and common image formats are accepted |
-| Extract line-item facts | Gemini structured extraction from receipt text/OCR |
-| Show verdict, category, reasoning, confidence | Rendered per line item in the review workspace |
-| Quote supporting policy clauses | Retrieved policy chunk quotes are stored and displayed |
-| Make flagged items visually distinct | Status badges and colors distinguish outcomes |
-| Reviewer overrides | Required comments are persisted as an audit log |
-| Submission history after restart | SQLite persistence for employees, submissions, items, overrides |
-| Policy Q&A with refusals | RAG answer generation cites chunks or refuses unsupported questions |
-| Evaluation harness | `eval_harness.py` accepts expected outcomes JSON and reports metrics |
 
 ## Design Choices And Tradeoffs
 
@@ -208,7 +225,7 @@ Tradeoff: SQLite is not the right long-term store for concurrent finance operati
 
 `gemini-2.5-flash` is used for structured receipt extraction, policy Q&A, and verdict generation. It is fast enough for an interactive reviewer workflow while still strong enough for messy receipts and policy reasoning.
 
-Tradeoff: a more expensive model might improve edge-case reasoning. The app compensates with retrieval, schema-constrained output, citation validation, and `needs_review` fallbacks.
+Tradeoff: a more expensive model might improve edge-case reasoning. The app compensates with retrieval, schema-constrained output, citation validation, retries, and `needs_review` fallbacks.
 
 ### Retrieval and chunking
 
